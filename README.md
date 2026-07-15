@@ -1,8 +1,29 @@
 # BlackBear Edge Bridge (BEB)
 
-BlackBear Edge Bridge is a small Python service that listens for PLC MQTT messages, parses the supported PLC-to-Odoo payloads, and provides a reusable publisher for commands back to the PLC.
+BlackBear Edge Bridge is a small Python service that listens for PLC MQTT messages, parses supported PLC-to-Odoo payloads, and stores valid messages in a local SQLite queue before any future processing.
 
-This milestone intentionally does not include Odoo API integration, SQLAlchemy usage, SQLite persistence, PLC topic changes, payload format changes, or a dashboard.
+This milestone intentionally does not include Odoo API integration, SQLAlchemy usage, printing, PLC topic changes, payload format changes, or a dashboard.
+
+## Architecture
+
+```text
+PLC
+ |
+ v
+MQTT
+ |
+ v
+Mosquitto
+ |
+ v
+BEB
+ |
+ v
+SQLite Queue
+ |
+ v
+Future Odoo API
+```
 
 ## Current Behavior
 
@@ -19,6 +40,9 @@ This milestone intentionally does not include Odoo API integration, SQLAlchemy u
   - `serial_number`: numeric serial characters before the table suffix
   - `table_number`: `T01`, `T02`, or `T03`
 - Logs each accepted MQTT message with timestamp, topic, raw payload, message type, table, model, and serial
+- Stores each valid message in `data/bridge.db` before any future processing
+- Uses a SHA256 hash of `topic + raw_payload` as the unique message identity
+- Ignores duplicate MQTT deliveries and logs `Duplicate message ignored`
 - Rejects malformed or unsupported messages with clear log messages
 - Provides `BEBMqttClient.publish_odoo_command(...)` for publishing to `MQTT/ODOO_TO_PLC/topic`
 - Reconnects automatically after unexpected MQTT disconnects
@@ -58,8 +82,62 @@ Type       : MN (Print Completed)
 Table      : T01
 Model      : 106-020C012P001
 Serial     : 3241
+Saved to SQLite
+ID         : 18
+Hash       : 53f4d8...
+Status     : NEW
 --------------------------------------------------
 ```
+
+## SQLite Queue
+
+The database is created automatically at `data/bridge.db` on startup or on the first message save.
+
+Table: `mqtt_messages`
+
+```text
+id INTEGER PRIMARY KEY AUTOINCREMENT
+received_at TEXT NOT NULL
+topic TEXT NOT NULL
+message_type TEXT NOT NULL
+table_no TEXT NOT NULL
+model TEXT NOT NULL
+serial TEXT NOT NULL
+raw_payload TEXT NOT NULL
+message_hash TEXT NOT NULL UNIQUE
+status TEXT NOT NULL
+retry_count INTEGER DEFAULT 0
+processed_at TEXT
+```
+
+Supported statuses:
+
+```text
+NEW
+PROCESSING
+COMPLETED
+FAILED
+```
+
+Current receive flow:
+
+```text
+Receive MQTT
+ |
+ v
+Parse JSON
+ |
+ v
+Generate SHA256 hash from topic + raw payload
+ |
+ v
+Ignore duplicate or insert NEW row into SQLite
+ |
+ v
+Log saved message details
+```
+
+No Odoo calls are made yet.
 
 ## Configuration
 
@@ -152,6 +230,10 @@ The parser unit tests cover:
 - unsupported key
 - missing table suffix
 - non-string value
+- database creation
+- message insert
+- duplicate detection
+- status update
 
 Run tests with:
 

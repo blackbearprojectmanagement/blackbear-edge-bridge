@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from app.config import AppConfig, load_config
+from app.database import initialize_database
 from app.mqtt_client import BEBMqttClient
 
 
@@ -18,6 +19,7 @@ def configure_logging(config: AppConfig) -> None:
 def main() -> None:
     config = load_config()
     configure_logging(config)
+    initialize_database(config.database_path)
 
     client = BEBMqttClient(config)
     try:

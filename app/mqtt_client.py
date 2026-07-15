@@ -11,6 +11,7 @@ from typing import Any, Callable
 import paho.mqtt.client as mqtt
 
 from app.config import AppConfig
+from app.database import SavedMessage, save_message
 from app.message_parser import PLCMessageParseError, ParsedPLCMessage, parse_plc_message
 
 LOGGER = logging.getLogger(__name__)
@@ -150,7 +151,27 @@ class BEBMqttClient:
             )
             return
 
-        LOGGER.info("\n%s", format_received_message_log(message.topic, raw_payload, parsed))
+        saved_message = save_message(
+            topic=message.topic,
+            raw_payload=raw_payload,
+            message_type=parsed.message_type,
+            table_no=parsed.table_number,
+            model=parsed.model_number,
+            serial=parsed.serial_number,
+            database_path=self._config.database_path,
+        )
+        if not saved_message.inserted:
+            LOGGER.info(
+                "Duplicate message ignored: topic=%s hash=%s",
+                message.topic,
+                saved_message.message_hash,
+            )
+            return
+
+        LOGGER.info(
+            "\n%s",
+            format_received_message_log(message.topic, raw_payload, parsed, saved_message),
+        )
         self._message_handler(parsed)
 
     @staticmethod
@@ -162,26 +183,35 @@ def format_received_message_log(
     topic: str,
     raw_payload: str,
     parsed: ParsedPLCMessage,
+    saved_message: SavedMessage | None = None,
     timestamp: datetime | None = None,
 ) -> str:
     """Build the formatted MQTT receive log block."""
     received_at = timestamp or datetime.now().astimezone()
     message_description = MESSAGE_TYPE_DESCRIPTIONS.get(parsed.message_type, "Unknown")
 
-    return "\n".join(
-        [
-            "-" * 50,
-            "Received MQTT Message",
-            f"Timestamp  : {received_at.isoformat(timespec='seconds')}",
-            f"Topic      : {topic}",
-            f"Raw Payload: {raw_payload}",
-            f"Type       : {parsed.message_type} ({message_description})",
-            f"Table      : {parsed.table_number}",
-            f"Model      : {parsed.model_number}",
-            f"Serial     : {parsed.serial_number}",
-            "-" * 50,
-        ]
-    )
+    lines = [
+        "-" * 50,
+        "Received MQTT Message",
+        f"Timestamp  : {received_at.isoformat(timespec='seconds')}",
+        f"Topic      : {topic}",
+        f"Raw Payload: {raw_payload}",
+        f"Type       : {parsed.message_type} ({message_description})",
+        f"Table      : {parsed.table_number}",
+        f"Model      : {parsed.model_number}",
+        f"Serial     : {parsed.serial_number}",
+    ]
+    if saved_message is not None:
+        lines.extend(
+            [
+                "Saved to SQLite",
+                f"ID         : {saved_message.id}",
+                f"Hash       : {saved_message.message_hash}",
+                f"Status     : {saved_message.status}",
+            ]
+        )
+    lines.append("-" * 50)
+    return "\n".join(lines)
 
 
 def _decode_payload_for_log(payload: bytes) -> str:
