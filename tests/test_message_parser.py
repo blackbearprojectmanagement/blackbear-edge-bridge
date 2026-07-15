@@ -7,20 +7,27 @@ from app.message_parser import PLCMessageParseError, parse_plc_message
 
 class TestParsePLCMessage(unittest.TestCase):
     def test_valid_mn(self) -> None:
-        parsed = parse_plc_message('{"MN":"106-020C012P001 3241T01"}')
+        parsed = parse_plc_message('{"MN":"106-020C012P0013241T01"}')
 
         self.assertEqual(parsed.message_type, "MN")
+        self.assertEqual(parsed.model_number, "106-020C012P001")
+        self.assertEqual(parsed.serial_number, "3241")
+        self.assertEqual(parsed.table_number, "T01")
+
+    def test_valid_mp(self) -> None:
+        parsed = parse_plc_message('{"MP":"Z106-015C020P0017084T02"}')
+
+        self.assertEqual(parsed.message_type, "MP")
+        self.assertEqual(parsed.model_number, "Z106-015C020P001")
+        self.assertEqual(parsed.serial_number, "7084")
+        self.assertEqual(parsed.table_number, "T02")
+
+    def test_spaced_payload_still_supported(self) -> None:
+        parsed = parse_plc_message('{"MN":"106-020C012P001 3241T01"}')
+
         self.assertEqual(parsed.part_data, "106-020C012P001")
         self.assertEqual(parsed.serial, "3241")
         self.assertEqual(parsed.table, "T01")
-
-    def test_valid_mp(self) -> None:
-        parsed = parse_plc_message('{"MP":"Z106-015C020P001 7084T02"}')
-
-        self.assertEqual(parsed.message_type, "MP")
-        self.assertEqual(parsed.part_data, "Z106-015C020P001")
-        self.assertEqual(parsed.serial, "7084")
-        self.assertEqual(parsed.table, "T02")
 
     def test_invalid_json(self) -> None:
         with self.assertRaisesRegex(PLCMessageParseError, "Malformed JSON"):

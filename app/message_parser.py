@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 
 SUPPORTED_MESSAGE_TYPES = frozenset({"MN", "MP"})
 SUPPORTED_TABLES = frozenset({"T01", "T02", "T03"})
+COMPACT_VALUE_PATTERN = re.compile(r"^(?P<model>.+P\d{3})(?P<serial>\d+)$")
 
 
 class PLCMessageParseError(ValueError):
@@ -18,9 +20,24 @@ class PLCMessageParseError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ParsedPLCMessage:
     message_type: str
-    part_data: str
-    serial: str
-    table: str
+    model_number: str
+    serial_number: str
+    table_number: str
+
+    @property
+    def part_data(self) -> str:
+        """Backward-compatible alias for the parsed model number."""
+        return self.model_number
+
+    @property
+    def serial(self) -> str:
+        """Backward-compatible alias for the parsed serial number."""
+        return self.serial_number
+
+    @property
+    def table(self) -> str:
+        """Backward-compatible alias for the parsed table number."""
+        return self.table_number
 
 
 def parse_plc_message(payload: str | bytes) -> ParsedPLCMessage:
@@ -38,14 +55,13 @@ def parse_plc_message(payload: str | bytes) -> ParsedPLCMessage:
     if not isinstance(value, str):
         raise PLCMessageParseError(f"PLC message value for {message_type} must be a string")
 
-    part_data, serial_with_table = _split_message_value(value)
-    serial, table = _split_serial_and_table(serial_with_table)
+    model_number, serial_number, table_number = _split_message_value(value)
 
     return ParsedPLCMessage(
         message_type=message_type,
-        part_data=part_data,
-        serial=serial,
-        table=table,
+        model_number=model_number,
+        serial_number=serial_number,
+        table_number=table_number,
     )
 
 
@@ -71,28 +87,44 @@ def _load_json_object(text: str) -> dict[str, Any]:
     return data
 
 
-def _split_message_value(value: str) -> tuple[str, str]:
-    try:
-        part_data, serial_with_table = value.rsplit(" ", maxsplit=1)
-    except ValueError as exc:
-        raise PLCMessageParseError(
-            "PLC message value must contain part data and serial/table separated by a space"
-        ) from exc
+def _split_message_value(value: str) -> tuple[str, str, str]:
+    value = value.strip()
+    table_number = value[-3:]
+    payload_without_table = value[:-3]
 
-    if not part_data:
-        raise PLCMessageParseError("PLC part data is missing")
-
-    return part_data, serial_with_table
-
-
-def _split_serial_and_table(serial_with_table: str) -> tuple[str, str]:
-    table = serial_with_table[-3:]
-    serial = serial_with_table[:-3]
-
-    if table not in SUPPORTED_TABLES:
+    if table_number not in SUPPORTED_TABLES:
         raise PLCMessageParseError("PLC message is missing a supported table suffix")
 
-    if not serial or not serial.isdigit():
+    if " " in payload_without_table:
+        model_number, serial_number = _split_spaced_payload(payload_without_table)
+    else:
+        model_number, serial_number = _split_compact_payload(payload_without_table)
+
+    if not model_number:
+        raise PLCMessageParseError("PLC model number is missing")
+
+    if not serial_number or not serial_number.isdigit():
         raise PLCMessageParseError("PLC serial must contain only numeric characters")
 
-    return serial, table
+    return model_number, serial_number, table_number
+
+
+def _split_spaced_payload(payload_without_table: str) -> tuple[str, str]:
+    try:
+        model_number, serial_number = payload_without_table.rsplit(" ", maxsplit=1)
+    except ValueError as exc:
+        raise PLCMessageParseError(
+            "PLC message value must contain model and serial data"
+        ) from exc
+
+    return model_number.strip(), serial_number.strip()
+
+
+def _split_compact_payload(payload_without_table: str) -> tuple[str, str]:
+    match = COMPACT_VALUE_PATTERN.fullmatch(payload_without_table)
+    if match is None:
+        raise PLCMessageParseError(
+            "Compact PLC payload must contain a model ending like P001 followed by a numeric serial"
+        )
+
+    return match.group("model"), match.group("serial")

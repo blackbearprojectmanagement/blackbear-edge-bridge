@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
@@ -17,6 +18,10 @@ QOS = 0
 
 
 MessageHandler = Callable[[ParsedPLCMessage], None]
+MESSAGE_TYPE_DESCRIPTIONS = {
+    "MN": "Print Completed",
+    "MP": "Loose Packet",
+}
 
 
 class BEBMqttClient:
@@ -133,21 +138,54 @@ class BEBMqttClient:
         userdata: Any,
         message: mqtt.MQTTMessage,
     ) -> None:
+        raw_payload = _decode_payload_for_log(message.payload)
         try:
             parsed = parse_plc_message(message.payload)
         except PLCMessageParseError as exc:
-            LOGGER.warning("Rejected PLC message on %s: %s", message.topic, exc)
+            LOGGER.warning(
+                "Rejected PLC message on %s: %s. Raw payload: %s",
+                message.topic,
+                exc,
+                raw_payload,
+            )
             return
 
-        LOGGER.info(
-            "Received PLC message: type=%s part_data=%s serial=%s table=%s",
-            parsed.message_type,
-            parsed.part_data,
-            parsed.serial,
-            parsed.table,
-        )
+        LOGGER.info("\n%s", format_received_message_log(message.topic, raw_payload, parsed))
         self._message_handler(parsed)
 
     @staticmethod
     def _default_message_handler(message: ParsedPLCMessage) -> None:
         LOGGER.debug("No downstream handler configured for parsed PLC message: %s", message)
+
+
+def format_received_message_log(
+    topic: str,
+    raw_payload: str,
+    parsed: ParsedPLCMessage,
+    timestamp: datetime | None = None,
+) -> str:
+    """Build the formatted MQTT receive log block."""
+    received_at = timestamp or datetime.now().astimezone()
+    message_description = MESSAGE_TYPE_DESCRIPTIONS.get(parsed.message_type, "Unknown")
+
+    return "\n".join(
+        [
+            "-" * 50,
+            "Received MQTT Message",
+            f"Timestamp  : {received_at.isoformat(timespec='seconds')}",
+            f"Topic      : {topic}",
+            f"Raw Payload: {raw_payload}",
+            f"Type       : {parsed.message_type} ({message_description})",
+            f"Table      : {parsed.table_number}",
+            f"Model      : {parsed.model_number}",
+            f"Serial     : {parsed.serial_number}",
+            "-" * 50,
+        ]
+    )
+
+
+def _decode_payload_for_log(payload: bytes) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return repr(payload)

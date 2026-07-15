@@ -11,17 +11,55 @@ This milestone intentionally does not include Odoo API integration, SQLAlchemy u
 - Uses MQTT v3.1.1, Callback API Version 2, QoS 0
 - Subscribes to `MQTT/PLC_TO_ODOO/topic`
 - Parses supported UTF-8 JSON PLC messages:
-  - `{"MN":"106-020C012P001 3241T01"}`
-  - `{"MP":"Z106-015C020P001 7084T02"}`
+  - `{"MN":"106-020C012P0013241T01"}`
+  - `{"MP":"Z106-015C020P0017084T02"}`
 - Extracts:
   - `message_type`: `MN` or `MP`
-  - `part_data`: everything before the final space
-  - `serial`: numeric characters after the final space and before the table suffix
-  - `table`: `T01`, `T02`, or `T03`
+  - `model_number`: model data before the serial number
+  - `serial_number`: numeric serial characters before the table suffix
+  - `table_number`: `T01`, `T02`, or `T03`
+- Logs each accepted MQTT message with timestamp, topic, raw payload, message type, table, model, and serial
 - Rejects malformed or unsupported messages with clear log messages
 - Provides `BEBMqttClient.publish_odoo_command(...)` for publishing to `MQTT/ODOO_TO_PLC/topic`
 - Reconnects automatically after unexpected MQTT disconnects
 - Shuts down cleanly on Ctrl+C
+
+`MN` means Print Completed. `MP` means Loose Packet.
+
+The current compact PLC payload format puts the table number in the final three characters:
+
+```text
+106-020C012P0013241T01
+```
+
+This is parsed as:
+
+```text
+Model  : 106-020C012P001
+Serial : 3241
+Table  : T01
+```
+
+For compatibility with the first milestone, the parser also accepts the earlier spaced format:
+
+```text
+106-020C012P001 3241T01
+```
+
+Example receive log:
+
+```text
+--------------------------------------------------
+Received MQTT Message
+Timestamp  : 2026-07-15T15:40:12+05:30
+Topic      : MQTT/PLC_TO_ODOO/topic
+Raw Payload: {"MN":"106-020C012P0013241T01"}
+Type       : MN (Print Completed)
+Table      : T01
+Model      : 106-020C012P001
+Serial     : 3241
+--------------------------------------------------
+```
 
 ## Configuration
 
@@ -109,6 +147,7 @@ The parser unit tests cover:
 
 - valid `MN`
 - valid `MP`
+- compatibility with the earlier spaced payload format
 - invalid JSON
 - unsupported key
 - missing table suffix
