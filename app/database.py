@@ -1,4 +1,4 @@
-"""SQLite persistence for received MQTT messages."""
+"""SQLite persistence and queue state for received MQTT messages."""
 
 from __future__ import annotations
 
@@ -16,6 +16,27 @@ DEFAULT_DATABASE_PATH = Path("data/bridge.db")
 VALID_STATUSES = frozenset({"NEW", "PROCESSING", "COMPLETED", "FAILED"})
 StatusValue = Literal["NEW", "PROCESSING", "COMPLETED", "FAILED"]
 
+BASE_COLUMNS = {
+    "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+    "received_at": "TEXT NOT NULL",
+    "topic": "TEXT NOT NULL",
+    "message_type": "TEXT NOT NULL",
+    "table_no": "TEXT NOT NULL",
+    "model": "TEXT NOT NULL",
+    "serial": "TEXT NOT NULL",
+    "raw_payload": "TEXT NOT NULL",
+    "message_hash": "TEXT NOT NULL UNIQUE",
+    "status": "TEXT NOT NULL",
+    "retry_count": "INTEGER DEFAULT 0",
+    "processed_at": "TEXT",
+}
+MIGRATION_COLUMNS = {
+    "last_error": "TEXT",
+    "odoo_response": "TEXT",
+    "last_attempt_at": "TEXT",
+    "completed_at": "TEXT",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class SavedMessage:
@@ -26,7 +47,7 @@ class SavedMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class MqttMessageRecord:
+class MessageRecord:
     id: int
     received_at: str
     topic: str
@@ -39,10 +60,17 @@ class MqttMessageRecord:
     status: str
     retry_count: int
     processed_at: str | None
+    last_error: str | None = None
+    odoo_response: str | None = None
+    last_attempt_at: str | None = None
+    completed_at: str | None = None
+
+
+MqttMessageRecord = MessageRecord
 
 
 def initialize_database(database_path: str | Path = DEFAULT_DATABASE_PATH) -> None:
-    """Create the SQLite database and required tables if they do not exist."""
+    """Create or migrate the SQLite database without destroying existing data."""
     db_path = Path(database_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -65,10 +93,17 @@ def initialize_database(database_path: str | Path = DEFAULT_DATABASE_PATH) -> No
             )
             """
         )
+        _migrate_mqtt_messages(connection)
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_mqtt_messages_status_id
             ON mqtt_messages (status, id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mqtt_messages_status_retry_id
+            ON mqtt_messages (status, retry_count, id)
             """
         )
 
@@ -86,19 +121,13 @@ def save_message(
 ) -> SavedMessage:
     """Persist a parsed MQTT message unless its topic/payload hash already exists."""
     initialize_database(database_path)
-    db_path = Path(database_path)
     received_at_text = _format_timestamp(received_at or datetime.now(UTC))
     message_hash = generate_message_hash(topic, raw_payload)
 
-    with _open_connection(db_path) as connection:
+    with _open_connection(database_path) as connection:
         existing = _get_saved_message_by_hash(connection, message_hash)
         if existing is not None:
-            return SavedMessage(
-                id=existing.id,
-                message_hash=existing.message_hash,
-                status=existing.status,
-                inserted=False,
-            )
+            return existing
 
         try:
             cursor = connection.execute(
@@ -161,26 +190,14 @@ def message_exists(
 def get_pending_messages(
     database_path: str | Path = DEFAULT_DATABASE_PATH,
     limit: int = 100,
-) -> list[MqttMessageRecord]:
-    """Return NEW messages in insertion order for future processing."""
+) -> list[MessageRecord]:
+    """Return NEW messages in insertion order for legacy callers."""
     initialize_database(database_path)
 
     with _open_connection(database_path) as connection:
         rows = connection.execute(
-            """
-            SELECT
-                id,
-                received_at,
-                topic,
-                message_type,
-                table_no,
-                model,
-                serial,
-                raw_payload,
-                message_hash,
-                status,
-                retry_count,
-                processed_at
+            f"""
+            SELECT {_record_columns_sql()}
             FROM mqtt_messages
             WHERE status = ?
             ORDER BY id ASC
@@ -198,7 +215,7 @@ def update_status(
     database_path: str | Path = DEFAULT_DATABASE_PATH,
     processed_at: datetime | None = None,
 ) -> None:
-    """Update the processing status for a persisted MQTT message."""
+    """Update status for legacy callers while preserving the queue schema."""
     if status not in VALID_STATUSES:
         raise ValueError(f"Unsupported message status: {status}")
 
@@ -220,13 +237,191 @@ def update_status(
             raise ValueError(f"Message id not found: {message_id}")
 
 
+def claim_pending_messages(
+    batch_size: int,
+    max_retries: int,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> list[MessageRecord]:
+    """Atomically claim NEW and retryable FAILED messages for Odoo processing."""
+    initialize_database(database_path)
+    if batch_size <= 0:
+        return []
+
+    last_attempt_at = _format_timestamp(datetime.now(UTC))
+    connection = _connect(database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            """
+            SELECT id
+            FROM mqtt_messages
+            WHERE status = ?
+               OR (status = ? AND retry_count < ?)
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            ("NEW", "FAILED", max_retries, batch_size),
+        ).fetchall()
+        message_ids = [int(row["id"]) for row in rows]
+        if not message_ids:
+            connection.commit()
+            return []
+
+        placeholders = ",".join("?" for _ in message_ids)
+        connection.execute(
+            f"""
+            UPDATE mqtt_messages
+            SET status = ?, last_attempt_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            ("PROCESSING", last_attempt_at, *message_ids),
+        )
+        claimed_rows = connection.execute(
+            f"""
+            SELECT {_record_columns_sql()}
+            FROM mqtt_messages
+            WHERE id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            message_ids,
+        ).fetchall()
+        connection.commit()
+        return [_record_from_row(row) for row in claimed_rows]
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def mark_completed(
+    message_id: int,
+    odoo_response: str,
+    completed_at: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Mark a queue row COMPLETED and store the returned Odoo response."""
+    initialize_database(database_path)
+
+    with _open_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE mqtt_messages
+            SET status = ?,
+                processed_at = ?,
+                completed_at = ?,
+                last_error = NULL,
+                odoo_response = ?
+            WHERE id = ?
+            """,
+            ("COMPLETED", completed_at, completed_at, odoo_response, message_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Message id not found: {message_id}")
+
+
+def mark_failed(
+    message_id: int,
+    error: str,
+    last_attempt_at: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Mark a queue row FAILED, incrementing retry_count and storing last_error."""
+    initialize_database(database_path)
+
+    with _open_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE mqtt_messages
+            SET status = ?,
+                retry_count = retry_count + 1,
+                last_error = ?,
+                last_attempt_at = ?
+            WHERE id = ?
+            """,
+            ("FAILED", error, last_attempt_at, message_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Message id not found: {message_id}")
+
+
+def reset_stale_processing(
+    stale_before: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> int:
+    """Recover stale PROCESSING records left by an interrupted process."""
+    initialize_database(database_path)
+    recovered_at = _format_timestamp(datetime.now(UTC))
+
+    with _open_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE mqtt_messages
+            SET status = ?,
+                retry_count = retry_count + 1,
+                last_error = ?,
+                last_attempt_at = ?
+            WHERE status = ?
+              AND (last_attempt_at IS NULL OR last_attempt_at < ?)
+            """,
+            (
+                "FAILED",
+                "Recovered stale PROCESSING message after application restart",
+                recovered_at,
+                "PROCESSING",
+                stale_before,
+            ),
+        )
+        return int(cursor.rowcount)
+
+
+def get_message_by_id(
+    message_id: int,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> MessageRecord | None:
+    """Return one queue record by id."""
+    initialize_database(database_path)
+
+    with _open_connection(database_path) as connection:
+        row = connection.execute(
+            f"""
+            SELECT {_record_columns_sql()}
+            FROM mqtt_messages
+            WHERE id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+
+    return _record_from_row(row) if row is not None else None
+
+
+def get_queue_counts(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> dict[str, int]:
+    """Return queue counts grouped by status."""
+    initialize_database(database_path)
+
+    with _open_connection(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM mqtt_messages
+            GROUP BY status
+            """
+        ).fetchall()
+
+    counts = {status: 0 for status in sorted(VALID_STATUSES)}
+    counts.update({str(row["status"]): int(row["count"]) for row in rows})
+    return counts
+
+
 def generate_message_hash(topic: str, raw_payload: str) -> str:
     """Generate the unique message identity from topic and raw payload."""
     return hashlib.sha256(f"{topic}{raw_payload}".encode("utf-8")).hexdigest()
 
 
 def _connect(database_path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(Path(database_path), timeout=30)
+    connection = sqlite3.connect(Path(database_path), timeout=30, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
@@ -237,10 +432,26 @@ def _connect(database_path: str | Path) -> sqlite3.Connection:
 def _open_connection(database_path: str | Path) -> Iterator[sqlite3.Connection]:
     connection = _connect(database_path)
     try:
+        connection.execute("BEGIN")
         yield connection
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
+
+
+def _migrate_mqtt_messages(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(mqtt_messages)").fetchall()
+    }
+    for column_name, definition in MIGRATION_COLUMNS.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE mqtt_messages ADD COLUMN {column_name} {definition}"
+            )
 
 
 def _get_saved_message_by_hash(
@@ -267,8 +478,8 @@ def _get_saved_message_by_hash(
     )
 
 
-def _record_from_row(row: sqlite3.Row) -> MqttMessageRecord:
-    return MqttMessageRecord(
+def _record_from_row(row: sqlite3.Row) -> MessageRecord:
+    return MessageRecord(
         id=int(row["id"]),
         received_at=str(row["received_at"]),
         topic=str(row["topic"]),
@@ -281,7 +492,32 @@ def _record_from_row(row: sqlite3.Row) -> MqttMessageRecord:
         status=str(row["status"]),
         retry_count=int(row["retry_count"]),
         processed_at=row["processed_at"],
+        last_error=row["last_error"],
+        odoo_response=row["odoo_response"],
+        last_attempt_at=row["last_attempt_at"],
+        completed_at=row["completed_at"],
     )
+
+
+def _record_columns_sql() -> str:
+    return """
+        id,
+        received_at,
+        topic,
+        message_type,
+        table_no,
+        model,
+        serial,
+        raw_payload,
+        message_hash,
+        status,
+        retry_count,
+        processed_at,
+        last_error,
+        odoo_response,
+        last_attempt_at,
+        completed_at
+    """
 
 
 def _format_timestamp(value: datetime) -> str:

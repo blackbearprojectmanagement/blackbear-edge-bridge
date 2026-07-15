@@ -5,3 +5,8 @@ __pycache__/
 data/*.db
 logs/*.log
 .vscode/
+
+# Odoo XML-RPC reference samples
+odoo_sample/
+xmlrpc_print_client/
+xmlrpc_print_client.zip
