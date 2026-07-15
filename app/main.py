@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from app.config import AppConfig, load_config
 from app.database import initialize_database
@@ -18,7 +19,10 @@ def configure_logging(config: AppConfig) -> None:
     )
 
 
-def create_odoo_worker(config: AppConfig) -> tuple[OdooQueueWorker, OdooXmlRpcClient] | None:
+def create_odoo_worker(
+    config: AppConfig,
+    ack_publisher: Callable[[str], bool] | None = None,
+) -> tuple[OdooQueueWorker, OdooXmlRpcClient] | None:
     if not config.odoo_enabled:
         logging.getLogger(__name__).info(
             "Odoo integration disabled; messages will remain in SQLite with status NEW."
@@ -41,6 +45,7 @@ def create_odoo_worker(config: AppConfig) -> tuple[OdooQueueWorker, OdooXmlRpcCl
         batch_size=config.odoo_batch_size,
         max_retries=config.odoo_max_retries,
         stale_processing_timeout=config.odoo_stale_processing_seconds,
+        ack_publisher=ack_publisher,
     )
     return worker, odoo_client
 
@@ -51,7 +56,7 @@ def main() -> None:
     initialize_database(config.database_path)
 
     client = BEBMqttClient(config)
-    worker_bundle = create_odoo_worker(config)
+    worker_bundle = create_odoo_worker(config, ack_publisher=client.publish_ack)
     worker: OdooQueueWorker | None = None
     odoo_client: OdooXmlRpcClient | None = None
     if worker_bundle is not None:

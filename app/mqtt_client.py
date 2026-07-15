@@ -91,6 +91,10 @@ class BEBMqttClient:
 
         LOGGER.info("Published command to %s", self._config.mqtt_odoo_to_plc_topic)
 
+    def publish_ack(self, ack: str) -> bool:
+        """Publish an ACK payload to the PLC command topic."""
+        return publish_ack(self._client, self._config.mqtt_odoo_to_plc_topic, ack)
+
     def _on_connect(
         self,
         client: mqtt.Client,
@@ -212,6 +216,59 @@ def format_received_message_log(
         )
     lines.append("-" * 50)
     return "\n".join(lines)
+
+
+def publish_ack(client: mqtt.Client, topic: str, ack: str) -> bool:
+    """Publish an Odoo ACK response back to the PLC."""
+    payload = json.dumps({"ACK": ack}, separators=(",", ":"))
+    LOGGER.info("\n%s", format_ack_publish_log(ack, topic))
+
+    try:
+        info = client.publish(topic, payload=payload, qos=QOS, retain=False)
+    except Exception as exc:
+        LOGGER.error("\n%s", format_ack_publish_failure_log(str(exc)))
+        return False
+
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        LOGGER.error("\n%s", format_ack_publish_failure_log(f"MQTT publish rc={info.rc}"))
+        return False
+
+    LOGGER.info("\n%s", format_ack_publish_success_log(ack))
+    return True
+
+
+def format_ack_publish_log(ack: str, topic: str) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "Publishing ACK to PLC",
+            f"ACK        : {ack}",
+            f"Topic      : {topic}",
+            "-" * 50,
+        ]
+    )
+
+
+def format_ack_publish_success_log(ack: str) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "ACK Published Successfully",
+            f"ACK : {ack}",
+            "-" * 50,
+        ]
+    )
+
+
+def format_ack_publish_failure_log(reason: str) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "ACK Publish Failed",
+            f"Reason : {reason}",
+            "-" * 50,
+        ]
+    )
 
 
 def _decode_payload_for_log(payload: bytes) -> str:

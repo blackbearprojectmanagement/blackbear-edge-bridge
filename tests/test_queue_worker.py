@@ -10,9 +10,16 @@ from app.queue_worker import OdooQueueWorker
 
 
 class FakeOdooClient:
-    def __init__(self, *, authenticated: bool = True, fail_on: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        authenticated: bool = True,
+        fail_on: int | None = None,
+        response: object | None = None,
+    ) -> None:
         self.authenticated = authenticated
         self.fail_on = fail_on
+        self.response = response
         self.authenticate_calls = 0
         self.submitted_payloads: list[dict[str, str]] = []
 
@@ -29,6 +36,8 @@ class FakeOdooClient:
         self.submitted_payloads.append(payload)
         if self.fail_on == len(self.submitted_payloads):
             raise OdooSubmissionError("submission failed")
+        if self.response is not None:
+            return self.response
         return {"accepted": payload}
 
 
@@ -119,6 +128,38 @@ class TestOdooQueueWorker(unittest.TestCase):
             [{"MP": "Z106-015C020P001 7084T01"}],
         )
 
+    def test_successful_odoo_ack_is_published_after_completed(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3243T01"}', serial="3243")
+        fake_client = FakeOdooClient(response={"success": True, "result": {"ACK": "3243"}})
+        published_acks: list[str] = []
+        worker = self._worker(fake_client, ack_publisher=published_acks.append)
+
+        worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "COMPLETED")
+        self.assertEqual(published_acks, ["3243"])
+
+    def test_missing_ack_does_not_publish(self) -> None:
+        self._save_raw('{"MN":"106-020C012P001 3243T01"}', serial="3243")
+        fake_client = FakeOdooClient(response={"success": True, "result": {}})
+        published_acks: list[str] = []
+        worker = self._worker(fake_client, ack_publisher=published_acks.append)
+
+        worker.run_once()
+
+        self.assertEqual(published_acks, [])
+
+    def test_success_false_does_not_publish(self) -> None:
+        self._save_raw('{"MN":"106-020C012P001 3243T01"}', serial="3243")
+        fake_client = FakeOdooClient(response={"success": False, "result": {"ACK": "3243"}})
+        published_acks: list[str] = []
+        worker = self._worker(fake_client, ack_publisher=published_acks.append)
+
+        worker.run_once()
+
+        self.assertEqual(published_acks, [])
+
     def test_authentication_failure_does_not_claim_rows(self) -> None:
         saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
         fake_client = FakeOdooClient(authenticated=False)
@@ -130,7 +171,11 @@ class TestOdooQueueWorker(unittest.TestCase):
         self.assertEqual(processed, 0)
         self.assertEqual(record.status, "NEW")
 
-    def _worker(self, fake_client: FakeOdooClient) -> OdooQueueWorker:
+    def _worker(
+        self,
+        fake_client: FakeOdooClient,
+        ack_publisher=None,
+    ) -> OdooQueueWorker:
         return OdooQueueWorker(
             database_path=self.database_path,
             odoo_client=fake_client,
@@ -138,6 +183,7 @@ class TestOdooQueueWorker(unittest.TestCase):
             batch_size=10,
             max_retries=10,
             stale_processing_timeout=300,
+            ack_publisher=ack_publisher,
         )
 
     def _save_raw(

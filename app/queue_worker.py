@@ -8,7 +8,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.database import (
     MessageRecord,
@@ -36,6 +36,7 @@ class OdooQueueWorker:
         batch_size: int,
         max_retries: int,
         stale_processing_timeout: int,
+        ack_publisher: Callable[[str], bool] | None = None,
     ) -> None:
         self._database_path = Path(database_path)
         self._odoo_client = odoo_client
@@ -43,6 +44,7 @@ class OdooQueueWorker:
         self._batch_size = batch_size
         self._max_retries = max_retries
         self._stale_processing_timeout = stale_processing_timeout
+        self._ack_publisher = ack_publisher
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -138,6 +140,19 @@ class OdooQueueWorker:
         response_text = repr(response)
         mark_completed(record.id, response_text, completed_at, self._database_path)
         LOGGER.info("\n%s", format_success_log(record, response_text))
+        self._publish_ack_if_available(response)
+
+    def _publish_ack_if_available(self, response: object) -> None:
+        ack = extract_ack(response)
+        if ack is None:
+            LOGGER.warning("Odoo response did not contain a publishable ACK; ACK not sent")
+            return
+
+        if self._ack_publisher is None:
+            LOGGER.warning("ACK %s received from Odoo but no MQTT ACK publisher is configured", ack)
+            return
+
+        self._ack_publisher(ack)
 
 
 def payload_from_record(record: MessageRecord) -> dict[str, str]:
@@ -161,6 +176,21 @@ def payload_from_record(record: MessageRecord) -> dict[str, str]:
         raise ValueError("Payload value must end in T01, T02, or T03")
 
     return {message_type: value}
+
+
+def extract_ack(response: object) -> str | None:
+    """Return ACK when Odoo response is successful and contains a string ACK."""
+    if not isinstance(response, dict):
+        return None
+    if response.get("success") is not True:
+        return None
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    ack = result.get("ACK")
+    return ack if isinstance(ack, str) and ack else None
 
 
 def format_success_log(record: MessageRecord, response_text: str) -> str:
