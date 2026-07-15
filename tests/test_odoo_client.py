@@ -38,6 +38,7 @@ class TestOdooXmlRpcClient(unittest.TestCase):
             server_proxy.call_args.args[0],
             "https://test-bbw.odoo.com/xmlrpc/2/common",
         )
+        self.assertEqual(server_proxy.call_args.kwargs, {})
         common.authenticate.assert_called_once_with(
             "broadtechit-test-bbw-stage-34933250",
             "admin",
@@ -69,6 +70,8 @@ class TestOdooXmlRpcClient(unittest.TestCase):
             server_proxy.call_args_list[1].args[0],
             "https://test-bbw.odoo.com/xmlrpc/2/object",
         )
+        self.assertEqual(server_proxy.call_args_list[0].kwargs, {})
+        self.assertEqual(server_proxy.call_args_list[1].kwargs, {})
         models.execute_kw.assert_called_once_with(
             "broadtechit-test-bbw-stage-34933250",
             7,

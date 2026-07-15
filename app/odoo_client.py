@@ -6,7 +6,6 @@ import logging
 import socket
 import ssl
 import xmlrpc.client
-from typing import Any
 
 
 LOGGER = logging.getLogger(__name__)
@@ -18,19 +17,6 @@ class OdooAuthenticationError(Exception):
 
 class OdooSubmissionError(Exception):
     """Raised when submitting print data to Odoo fails."""
-
-
-class TimeoutTransport(xmlrpc.client.SafeTransport):
-    """XML-RPC HTTPS transport that applies a per-connection timeout."""
-
-    def __init__(self, timeout: int) -> None:
-        super().__init__()
-        self._timeout = timeout
-
-    def make_connection(self, host: str) -> Any:
-        connection = super().make_connection(host)
-        connection.timeout = self._timeout
-        return connection
 
 
 class OdooXmlRpcClient:
@@ -52,7 +38,6 @@ class OdooXmlRpcClient:
         self._password = password
         self._model = model
         self._submit_method = submit_method
-        self._timeout = timeout
         self._uid: int | None = None
         self._common: xmlrpc.client.ServerProxy | None = None
         self._models: xmlrpc.client.ServerProxy | None = None
@@ -135,8 +120,6 @@ class OdooXmlRpcClient:
         if self._common is None:
             self._common = xmlrpc.client.ServerProxy(
                 f"{self._url}/xmlrpc/2/common",
-                allow_none=True,
-                transport=TimeoutTransport(self._timeout),
             )
         return self._common
 
@@ -144,8 +127,6 @@ class OdooXmlRpcClient:
         if self._models is None:
             self._models = xmlrpc.client.ServerProxy(
                 f"{self._url}/xmlrpc/2/object",
-                allow_none=True,
-                transport=TimeoutTransport(self._timeout),
             )
         return self._models
 
