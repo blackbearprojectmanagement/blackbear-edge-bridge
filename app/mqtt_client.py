@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
@@ -23,6 +24,16 @@ MESSAGE_TYPE_DESCRIPTIONS = {
     "MN": "Print Completed",
     "MP": "Loose Packet",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    success: bool
+    rc: int
+    mid: int | None
+    topic: str
+    payload: str
+    error: str | None = None
 
 
 class BEBMqttClient:
@@ -62,10 +73,29 @@ class BEBMqttClient:
         self.connect()
         self._client.loop_forever(retry_first_connection=True)
 
+    def start_loop(self) -> None:
+        """Start the MQTT network loop without blocking the main thread."""
+        LOGGER.info(
+            "Starting MQTT loop for broker %s:%s as %s",
+            self._config.mqtt_host,
+            self._config.mqtt_port,
+            self._config.mqtt_client_id,
+        )
+        self._client.connect_async(
+            self._config.mqtt_host,
+            self._config.mqtt_port,
+            self._config.mqtt_keepalive,
+        )
+        self._client.loop_start()
+
     def shutdown(self) -> None:
         LOGGER.info("Shutting down MQTT client")
         self._client.disconnect()
         self._client.loop_stop()
+
+    def is_connected(self) -> bool:
+        """Return whether the MQTT client currently reports a broker connection."""
+        return bool(self._client.is_connected())
 
     def publish_odoo_command(self, command: Mapping[str, Any] | str | bytes) -> None:
         """Publish an Odoo-style command payload to the PLC command topic."""
@@ -90,6 +120,49 @@ class BEBMqttClient:
             return
 
         LOGGER.info("Published command to %s", self._config.mqtt_odoo_to_plc_topic)
+
+    def publish_plc_command(self, payload: dict[str, str]) -> PublishResult:
+        """Publish a validated PLC command to the configured command topic."""
+        topic = self._config.mqtt_odoo_to_plc_topic
+        payload_text = json.dumps(payload, separators=(",", ":"))
+
+        try:
+            if not self._client.is_connected():
+                return PublishResult(
+                    success=False,
+                    rc=mqtt.MQTT_ERR_NO_CONN,
+                    mid=None,
+                    topic=topic,
+                    payload=payload_text,
+                    error="MQTT broker unavailable",
+                )
+
+            info = self._client.publish(
+                topic,
+                payload=payload_text,
+                qos=QOS,
+                retain=False,
+            )
+        except Exception as exc:
+            return PublishResult(
+                success=False,
+                rc=mqtt.MQTT_ERR_UNKNOWN,
+                mid=None,
+                topic=topic,
+                payload=payload_text,
+                error=str(exc),
+            )
+
+        rc = int(info.rc)
+        success = rc == mqtt.MQTT_ERR_SUCCESS
+        return PublishResult(
+            success=success,
+            rc=rc,
+            mid=int(info.mid) if getattr(info, "mid", None) is not None else None,
+            topic=topic,
+            payload=payload_text,
+            error=None if success else f"MQTT publish rc={rc}",
+        )
 
     def publish_ack(self, ack: str) -> bool:
         """Publish an ACK payload to the PLC command topic."""

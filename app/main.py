@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Callable
 
+from app.api_server import BebApiServer
 from app.config import AppConfig, load_config
-from app.database import initialize_database
+from app.database import initialize_api_commands_table, initialize_database
 from app.mqtt_client import BEBMqttClient
 from app.odoo_client import OdooXmlRpcClient
 from app.queue_worker import OdooQueueWorker
@@ -54,6 +56,7 @@ def main() -> None:
     config = load_config()
     configure_logging(config)
     initialize_database(config.database_path)
+    initialize_api_commands_table(config.database_path)
 
     client = BEBMqttClient(config)
     worker_bundle = create_odoo_worker(config, ack_publisher=client.publish_ack)
@@ -63,14 +66,19 @@ def main() -> None:
         worker, odoo_client = worker_bundle
         worker.start()
 
+    api_server = BebApiServer(config, client, config.database_path)
+
     try:
-        client.run_forever()
+        client.start_loop()
+        api_server.start()
+        threading.Event().wait()
     except KeyboardInterrupt:
         logging.getLogger(__name__).info("Ctrl+C received")
     finally:
-        client.shutdown()
+        api_server.stop()
         if worker is not None:
             worker.stop()
+        client.shutdown()
         if odoo_client is not None:
             odoo_client.close()
 

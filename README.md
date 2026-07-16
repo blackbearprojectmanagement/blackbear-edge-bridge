@@ -1,16 +1,37 @@
 # BlackBear Edge Bridge (BEB)
 
-BlackBear Edge Bridge is a Python service that listens for PLC MQTT messages, validates and stores them in a local SQLite queue, then optionally forwards queued messages to Odoo through XML-RPC.
+BlackBear Edge Bridge is a Python service that bridges AWS-hosted Odoo, a local Mosquitto broker, and a PLC. It exposes a small authenticated HTTPS-ready API for Odoo-to-PLC commands, listens for PLC MQTT messages, stores PLC-to-Odoo events in a local SQLite queue, then optionally forwards queued messages to Odoo through XML-RPC.
 
 BEB does not print. Odoo continues to control the existing CUPS printing workflow, label templates, print routing, and printer communication.
 
 ## Architecture
 
 ```text
-Mitsubishi FX5U PLC
+AWS-hosted Odoo
+ |
+ | HTTPS POST /api/v1/plc/command
+ v
+Secure public BEB API URL
  |
  v
-Local MQTT / Mosquitto Broker
+BlackBear Edge Bridge
+ |
+ | MQTT publish
+ v
+Local Mosquitto
+ |
+ v
+PLC
+```
+
+Return path:
+
+```text
+PLC
+ |
+ | MQTT publish
+ v
+Local Mosquitto
  |
  v
 BlackBear Edge Bridge
@@ -24,6 +45,8 @@ Odoo XML-RPC API
  v
 Existing Odoo CUPS Printing Workflow
 ```
+
+There is no Odoo command polling. Odoo pushes commands to BEB immediately through the authenticated API. PLC-to-Odoo events continue to use the SQLite-backed XML-RPC queue.
 
 Confirmed Odoo test integration:
 
@@ -69,7 +92,7 @@ PLC to BEB : MQTT/PLC_TO_ODOO/topic
 BEB to PLC : MQTT/ODOO_TO_PLC/topic
 ```
 
-Milestone 4 does not send Odoo-to-PLC MQTT commands.
+BEB publishes Odoo-to-PLC API commands to the PLC command topic with QoS 0 and retain disabled.
 
 Supported PLC payloads:
 
@@ -79,6 +102,26 @@ Supported PLC payloads:
 ```
 
 `MN` means Print Completed. `MP` means Loose Packet.
+
+Supported Odoo-to-PLC API command payloads:
+
+```json
+{"messt01":"Z106-020C012P001"}
+{"messt02":"Z106-020C012P001"}
+{"messt03":"Z106-020C012P001"}
+{"T01":"P"}
+{"T01":"R"}
+{"T01":"D"}
+{"T02":"P"}
+{"T02":"R"}
+{"T02":"D"}
+{"T03":"P"}
+{"T03":"R"}
+{"T03":"D"}
+{"LP":"FT01"}
+{"LP":"FT02"}
+{"LP":"FT03"}
+```
 
 ## SQLite Queue
 
@@ -119,6 +162,29 @@ topic + raw_payload
 
 Duplicate MQTT deliveries are ignored and logged as `Duplicate message ignored`.
 
+Table: `api_commands`
+
+```text
+id INTEGER PRIMARY KEY AUTOINCREMENT
+request_id TEXT NOT NULL UNIQUE
+idempotency_key TEXT UNIQUE
+received_at TEXT NOT NULL
+username TEXT
+remote_address TEXT
+payload TEXT NOT NULL
+payload_hash TEXT NOT NULL
+mqtt_topic TEXT NOT NULL
+status TEXT NOT NULL
+mqtt_rc INTEGER
+mqtt_mid INTEGER
+published_at TEXT
+response_code INTEGER
+response_body TEXT
+last_error TEXT
+```
+
+API command statuses are `RECEIVED`, `PUBLISHED`, `FAILED`, `DUPLICATE`, and `REJECTED`. The audit table is created automatically and does not alter or recreate `mqtt_messages`.
+
 ## Status State
 
 ```text
@@ -158,6 +224,40 @@ The object sent to Odoo is loaded from the original stored `raw_payload` and is 
 
 Any successful XML-RPC return marks the row `COMPLETED`. Faults, protocol errors, timeouts, and connection errors mark the row `FAILED` and allow later retry.
 
+## Authenticated Command API
+
+The API starts only when `BEB_API_ENABLED=true`. The default bind address is `127.0.0.1:8000`; keep it local and expose it externally only through a secure tunnel, VPN, or authenticated reverse proxy.
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Publish command:
+
+```bash
+curl -u odoo:<password> \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: PRINTJOB-2960-T01" \
+  -X POST \
+  -d '{"messt01":"Z106-020C012P001"}' \
+  http://127.0.0.1:8000/api/v1/plc/command
+```
+
+Authentication uses HTTP Basic credentials from `BEB_API_USERNAME` and `BEB_API_PASSWORD`. Passwords and `Authorization` headers are never logged.
+
+Send an `Idempotency-Key` for each Odoo print-job command, for example `PRINTJOB-2960-T01`. If the same key is received again within `BEB_API_IDEMPOTENCY_TTL_SECONDS`, BEB returns the original stored response and does not publish to MQTT again. Requests without an idempotency key are accepted, but duplicate prevention is weaker.
+
+Local smoke test:
+
+```powershell
+$env:BEB_API_URL = "http://127.0.0.1:8000"
+$env:BEB_API_USERNAME = "odoo"
+$env:BEB_API_PASSWORD = "<password>"
+python -m scripts.test_beb_api
+```
+
 ## Environment
 
 Development defaults:
@@ -175,7 +275,7 @@ ODOO_ENABLED=false
 ODOO_URL=https://test-bbw.odoo.com
 ODOO_DATABASE=broadtechit-test-bbw-stage-34933250
 ODOO_USERNAME=admin
-ODOO_PASSWORD=TEst@#$mvjurT
+ODOO_PASSWORD=
 ODOO_MODEL=iot.configuration
 ODOO_SUBMIT_METHOD=xmlrpc_submit_print_data
 ODOO_TIMEOUT=15
@@ -183,6 +283,15 @@ ODOO_WORKER_INTERVAL=2
 ODOO_BATCH_SIZE=10
 ODOO_MAX_RETRIES=10
 ODOO_STALE_PROCESSING_SECONDS=300
+BEB_API_ENABLED=false
+BEB_API_HOST=127.0.0.1
+BEB_API_PORT=8000
+BEB_API_USERNAME=odoo
+BEB_API_PASSWORD=
+BEB_API_REQUEST_TIMEOUT=10
+BEB_API_IDEMPOTENCY_TTL_SECONDS=86400
+BEB_API_MAX_BODY_BYTES=16384
+BEB_API_LOG_REQUEST_BODY=true
 ```
 
 The real `.env` file is ignored by Git. Do not print or log `ODOO_PASSWORD`.
@@ -216,7 +325,7 @@ ODOO_ENABLED=true
 ODOO_URL=https://test-bbw.odoo.com
 ODOO_DATABASE=broadtechit-test-bbw-stage-34933250
 ODOO_USERNAME=admin
-ODOO_PASSWORD=TEst@#$mvjurT
+ODOO_PASSWORD=
 ODOO_MODEL=iot.configuration
 ODOO_SUBMIT_METHOD=xmlrpc_submit_print_data
 ODOO_TIMEOUT=15
@@ -224,6 +333,16 @@ ODOO_WORKER_INTERVAL=2
 ODOO_BATCH_SIZE=10
 ODOO_MAX_RETRIES=10
 ODOO_STALE_PROCESSING_SECONDS=300
+
+BEB_API_ENABLED=true
+BEB_API_HOST=127.0.0.1
+BEB_API_PORT=8000
+BEB_API_USERNAME=odoo
+BEB_API_PASSWORD=<set-a-strong-password>
+BEB_API_REQUEST_TIMEOUT=10
+BEB_API_IDEMPOTENCY_TTL_SECONDS=86400
+BEB_API_MAX_BODY_BYTES=16384
+BEB_API_LOG_REQUEST_BODY=true
 ```
 
 ## Windows Development
@@ -245,6 +364,12 @@ python -m scripts.test_odoo_connection
 ```
 
 The live check prints URL, database, username, model, method, and the Odoo response. It never prints the password.
+
+Optional local API check:
+
+```powershell
+python -m scripts.test_beb_api
+```
 
 ## Ubuntu Deployment
 
@@ -285,4 +410,6 @@ WantedBy=multi-user.target
 
 ## Restrictions
 
-BEB does not implement CUPS, printer communication, label design, direct printing, Odoo print logic, Odoo-to-PLC polling, pause/resume/done workflows, a dashboard, or a web framework.
+BEB does not implement CUPS, printer communication, label design, direct printing, Odoo print logic, Odoo-to-PLC polling, an Odoo command retrieval queue, a dashboard, or frontend code.
+
+Do not expose Mosquitto port `1883` publicly. Use Cloudflare Tunnel for pilot testing, or a site-to-site VPN/authenticated reverse proxy for permanent deployment of the HTTP API. Tunnel setup is intentionally outside BEB application code.

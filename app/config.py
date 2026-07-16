@@ -31,6 +31,15 @@ class AppConfig:
     odoo_batch_size: int
     odoo_max_retries: int
     odoo_stale_processing_seconds: int
+    beb_api_enabled: bool = False
+    beb_api_host: str = "127.0.0.1"
+    beb_api_port: int = 8000
+    beb_api_username: str = "odoo"
+    beb_api_password: str = ""
+    beb_api_request_timeout: int = 10
+    beb_api_idempotency_ttl_seconds: int = 86400
+    beb_api_max_body_bytes: int = 16384
+    beb_api_log_request_body: bool = True
 
 
 def _get_int(name: str, default: int) -> int:
@@ -93,4 +102,15 @@ def load_config() -> AppConfig:
         odoo_stale_processing_seconds=_get_int(
             "ODOO_STALE_PROCESSING_SECONDS", 300
         ),
+        beb_api_enabled=_get_bool("BEB_API_ENABLED", False),
+        beb_api_host=os.getenv("BEB_API_HOST", "127.0.0.1"),
+        beb_api_port=_get_int("BEB_API_PORT", 8000),
+        beb_api_username=os.getenv("BEB_API_USERNAME", "odoo"),
+        beb_api_password=os.getenv("BEB_API_PASSWORD", ""),
+        beb_api_request_timeout=_get_int("BEB_API_REQUEST_TIMEOUT", 10),
+        beb_api_idempotency_ttl_seconds=_get_int(
+            "BEB_API_IDEMPOTENCY_TTL_SECONDS", 86400
+        ),
+        beb_api_max_body_bytes=_get_int("BEB_API_MAX_BODY_BYTES", 16384),
+        beb_api_log_request_body=_get_bool("BEB_API_LOG_REQUEST_BODY", True),
     )

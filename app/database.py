@@ -15,6 +15,12 @@ from typing import Literal
 DEFAULT_DATABASE_PATH = Path("data/bridge.db")
 VALID_STATUSES = frozenset({"NEW", "PROCESSING", "COMPLETED", "FAILED"})
 StatusValue = Literal["NEW", "PROCESSING", "COMPLETED", "FAILED"]
+API_COMMAND_STATUSES = frozenset(
+    {"RECEIVED", "PUBLISHED", "FAILED", "DUPLICATE", "REJECTED"}
+)
+ApiCommandStatusValue = Literal[
+    "RECEIVED", "PUBLISHED", "FAILED", "DUPLICATE", "REJECTED"
+]
 
 BASE_COLUMNS = {
     "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
@@ -69,6 +75,26 @@ class MessageRecord:
 MqttMessageRecord = MessageRecord
 
 
+@dataclass(frozen=True, slots=True)
+class ApiCommandRecord:
+    id: int
+    request_id: str
+    idempotency_key: str | None
+    received_at: str
+    username: str | None
+    remote_address: str | None
+    payload: str
+    payload_hash: str
+    mqtt_topic: str
+    status: str
+    mqtt_rc: int | None
+    mqtt_mid: int | None
+    published_at: str | None
+    response_code: int | None
+    response_body: str | None
+    last_error: str | None
+
+
 def initialize_database(database_path: str | Path = DEFAULT_DATABASE_PATH) -> None:
     """Create or migrate the SQLite database without destroying existing data."""
     db_path = Path(database_path)
@@ -106,6 +132,209 @@ def initialize_database(database_path: str | Path = DEFAULT_DATABASE_PATH) -> No
             ON mqtt_messages (status, retry_count, id)
             """
         )
+
+
+def initialize_api_commands_table(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Create the API command audit table without changing queue data."""
+    db_path = Path(database_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with _open_connection(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                idempotency_key TEXT UNIQUE,
+                received_at TEXT NOT NULL,
+                username TEXT,
+                remote_address TEXT,
+                payload TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                mqtt_topic TEXT NOT NULL,
+                status TEXT NOT NULL,
+                mqtt_rc INTEGER,
+                mqtt_mid INTEGER,
+                published_at TEXT,
+                response_code INTEGER,
+                response_body TEXT,
+                last_error TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_api_commands_idempotency_key
+            ON api_commands (idempotency_key)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_api_commands_request_id
+            ON api_commands (request_id)
+            """
+        )
+
+
+def create_api_command_record(
+    *,
+    request_id: str,
+    idempotency_key: str | None,
+    username: str | None,
+    remote_address: str | None,
+    payload: str,
+    mqtt_topic: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    status: ApiCommandStatusValue = "RECEIVED",
+    received_at: datetime | None = None,
+) -> ApiCommandRecord:
+    """Create an API command audit row."""
+    if status not in API_COMMAND_STATUSES:
+        raise ValueError(f"Unsupported API command status: {status}")
+
+    initialize_api_commands_table(database_path)
+    received_at_text = _format_timestamp(received_at or datetime.now(UTC))
+    payload_hash = generate_api_payload_hash(payload)
+
+    with _open_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO api_commands (
+                request_id,
+                idempotency_key,
+                received_at,
+                username,
+                remote_address,
+                payload,
+                payload_hash,
+                mqtt_topic,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                idempotency_key,
+                received_at_text,
+                username,
+                remote_address,
+                payload,
+                payload_hash,
+                mqtt_topic,
+                status,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT *
+            FROM api_commands
+            WHERE id = ?
+            """,
+            (int(cursor.lastrowid),),
+        ).fetchone()
+
+    return _api_command_from_row(row)
+
+
+def get_api_command_by_idempotency_key(
+    idempotency_key: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> ApiCommandRecord | None:
+    """Return an API command audit row by Idempotency-Key."""
+    initialize_api_commands_table(database_path)
+
+    with _open_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM api_commands
+            WHERE idempotency_key = ?
+            LIMIT 1
+            """,
+            (idempotency_key,),
+        ).fetchone()
+
+    return _api_command_from_row(row) if row is not None else None
+
+
+def mark_api_command_published(
+    request_id: str,
+    mqtt_rc: int,
+    mqtt_mid: int | None,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    published_at: datetime | None = None,
+) -> None:
+    """Mark an API command as published to MQTT."""
+    _update_api_command_result(
+        request_id=request_id,
+        status="PUBLISHED",
+        mqtt_rc=mqtt_rc,
+        mqtt_mid=mqtt_mid,
+        published_at=_format_timestamp(published_at or datetime.now(UTC)),
+        last_error=None,
+        database_path=database_path,
+    )
+
+
+def mark_api_command_failed(
+    request_id: str,
+    error: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    mqtt_rc: int | None = None,
+    mqtt_mid: int | None = None,
+) -> None:
+    """Mark an API command as failed."""
+    _update_api_command_result(
+        request_id=request_id,
+        status="FAILED",
+        mqtt_rc=mqtt_rc,
+        mqtt_mid=mqtt_mid,
+        published_at=None,
+        last_error=error,
+        database_path=database_path,
+    )
+
+
+def mark_api_command_rejected(
+    request_id: str,
+    error: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Mark an API command as rejected."""
+    _update_api_command_result(
+        request_id=request_id,
+        status="REJECTED",
+        mqtt_rc=None,
+        mqtt_mid=None,
+        published_at=None,
+        last_error=error,
+        database_path=database_path,
+    )
+
+
+def save_api_response(
+    request_id: str,
+    response_code: int,
+    response_body: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Persist the response sent for an API command."""
+    initialize_api_commands_table(database_path)
+
+    with _open_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE api_commands
+            SET response_code = ?,
+                response_body = ?
+            WHERE request_id = ?
+            """,
+            (response_code, response_body, request_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"API command request_id not found: {request_id}")
 
 
 def save_message(
@@ -420,6 +649,11 @@ def generate_message_hash(topic: str, raw_payload: str) -> str:
     return hashlib.sha256(f"{topic}{raw_payload}".encode("utf-8")).hexdigest()
 
 
+def generate_api_payload_hash(payload: str) -> str:
+    """Generate the audit hash for an API command payload."""
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _connect(database_path: str | Path) -> sqlite3.Connection:
     connection = sqlite3.connect(Path(database_path), timeout=30, isolation_level=None)
     connection.row_factory = sqlite3.Row
@@ -497,6 +731,59 @@ def _record_from_row(row: sqlite3.Row) -> MessageRecord:
         last_attempt_at=row["last_attempt_at"],
         completed_at=row["completed_at"],
     )
+
+
+def _api_command_from_row(row: sqlite3.Row) -> ApiCommandRecord:
+    return ApiCommandRecord(
+        id=int(row["id"]),
+        request_id=str(row["request_id"]),
+        idempotency_key=row["idempotency_key"],
+        received_at=str(row["received_at"]),
+        username=row["username"],
+        remote_address=row["remote_address"],
+        payload=str(row["payload"]),
+        payload_hash=str(row["payload_hash"]),
+        mqtt_topic=str(row["mqtt_topic"]),
+        status=str(row["status"]),
+        mqtt_rc=row["mqtt_rc"],
+        mqtt_mid=row["mqtt_mid"],
+        published_at=row["published_at"],
+        response_code=row["response_code"],
+        response_body=row["response_body"],
+        last_error=row["last_error"],
+    )
+
+
+def _update_api_command_result(
+    *,
+    request_id: str,
+    status: ApiCommandStatusValue,
+    mqtt_rc: int | None,
+    mqtt_mid: int | None,
+    published_at: str | None,
+    last_error: str | None,
+    database_path: str | Path,
+) -> None:
+    if status not in API_COMMAND_STATUSES:
+        raise ValueError(f"Unsupported API command status: {status}")
+
+    initialize_api_commands_table(database_path)
+
+    with _open_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE api_commands
+            SET status = ?,
+                mqtt_rc = ?,
+                mqtt_mid = ?,
+                published_at = ?,
+                last_error = ?
+            WHERE request_id = ?
+            """,
+            (status, mqtt_rc, mqtt_mid, published_at, last_error, request_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"API command request_id not found: {request_id}")
 
 
 def _record_columns_sql() -> str:
