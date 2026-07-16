@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -118,26 +120,56 @@ class OdooQueueWorker:
         last_attempt_at = _timestamp(datetime.now(UTC))
         try:
             payload = payload_from_record(record)
+        except ValueError as exc:
+            failed_record = self._mark_record_failed(record, str(exc), last_attempt_at)
+            LOGGER.error("\n%s", format_failure_log(failed_record, str(exc)))
+            return
+
+        LOGGER.info("\n%s", format_xmlrpc_submission_started_log(record))
+        start_time = time.monotonic()
+        try:
             response = self._odoo_client.submit_print_data(payload)
         except (ValueError, OdooAuthenticationError, OdooSubmissionError) as exc:
-            mark_failed(record.id, str(exc), last_attempt_at, self._database_path)
-            failed_record = replace(
-                record,
-                status="FAILED",
-                retry_count=record.retry_count + 1,
-                last_error=str(exc),
-                last_attempt_at=last_attempt_at,
+            elapsed_seconds = time.monotonic() - start_time
+            LOGGER.error(
+                "\n%s",
+                format_xmlrpc_submission_failed_log(record, elapsed_seconds, str(exc)),
             )
+            failed_record = self._mark_record_failed(record, str(exc), last_attempt_at)
             LOGGER.error("\n%s", format_failure_log(failed_record, str(exc)))
             return
         except Exception as exc:
-            mark_failed(record.id, str(exc), last_attempt_at, self._database_path)
-            failed_record = replace(record, status="FAILED", retry_count=record.retry_count + 1)
+            elapsed_seconds = time.monotonic() - start_time
+            LOGGER.error(
+                "\n%s",
+                format_xmlrpc_submission_failed_log(record, elapsed_seconds, str(exc)),
+            )
+            failed_record = self._mark_record_failed(record, str(exc), last_attempt_at)
             LOGGER.exception("\n%s", format_failure_log(failed_record, str(exc)))
             return
 
+        elapsed_seconds = time.monotonic() - start_time
         completed_at = _timestamp(datetime.now(UTC))
         response_text = repr(response)
+        LOGGER.info(
+            "\n%s",
+            format_xmlrpc_submission_finished_log(record, elapsed_seconds, response_text),
+        )
+
+        business_error = get_odoo_business_error(response)
+        if business_error is not None:
+            failed_record = self._mark_record_failed(
+                record,
+                business_error,
+                last_attempt_at,
+                odoo_response=response_text,
+            )
+            LOGGER.error(
+                "\n%s",
+                format_business_failure_log(failed_record, business_error, response_text),
+            )
+            return
+
         mark_completed(record.id, response_text, completed_at, self._database_path)
         LOGGER.info("\n%s", format_success_log(record, response_text))
         self._publish_ack_if_available(response)
@@ -153,6 +185,29 @@ class OdooQueueWorker:
             return
 
         self._ack_publisher(ack)
+
+    def _mark_record_failed(
+        self,
+        record: MessageRecord,
+        error: str,
+        last_attempt_at: str,
+        odoo_response: str | None = None,
+    ) -> MessageRecord:
+        mark_failed(
+            record.id,
+            error,
+            last_attempt_at,
+            self._database_path,
+            odoo_response=odoo_response,
+        )
+        return replace(
+            record,
+            status="FAILED",
+            retry_count=record.retry_count + 1,
+            last_error=error,
+            last_attempt_at=last_attempt_at,
+            odoo_response=odoo_response if odoo_response is not None else record.odoo_response,
+        )
 
 
 def payload_from_record(record: MessageRecord) -> dict[str, str]:
@@ -191,6 +246,95 @@ def extract_ack(response: object) -> str | None:
 
     ack = result.get("ACK")
     return ack if isinstance(ack, str) and ack else None
+
+
+def get_odoo_business_error(response: object) -> str | None:
+    """Return an error string when an XML-RPC response is not a business success."""
+    if not isinstance(response, Mapping):
+        return "Invalid Odoo response: missing success flag"
+
+    success = response.get("success")
+    if success is True:
+        return None
+    if success is False:
+        error = response.get("error")
+        if isinstance(error, str) and error:
+            return error
+        return "Odoo business operation failed"
+
+    return "Invalid Odoo response: missing success flag"
+
+
+def format_xmlrpc_submission_started_log(record: MessageRecord) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "Odoo XML-RPC Submission Started",
+            f"Database ID : {record.id}",
+            f"Message Type: {record.message_type}",
+            f"Model       : {record.model}",
+            f"Serial      : {record.serial}",
+            f"Table       : {record.table_no}",
+            "-" * 50,
+        ]
+    )
+
+
+def format_xmlrpc_submission_finished_log(
+    record: MessageRecord,
+    elapsed_seconds: float,
+    response_text: str,
+) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "Odoo XML-RPC Submission Finished",
+            f"Database ID     : {record.id}",
+            f"Elapsed Seconds : {elapsed_seconds:.6f}",
+            f"Response        : {response_text}",
+            "-" * 50,
+        ]
+    )
+
+
+def format_xmlrpc_submission_failed_log(
+    record: MessageRecord,
+    elapsed_seconds: float,
+    error: str,
+) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "Odoo XML-RPC Submission Failed",
+            f"Database ID     : {record.id}",
+            f"Elapsed Seconds : {elapsed_seconds:.6f}",
+            f"Error           : {error}",
+            "-" * 50,
+        ]
+    )
+
+
+def format_business_failure_log(
+    record: MessageRecord,
+    error: str,
+    response_text: str,
+) -> str:
+    return "\n".join(
+        [
+            "-" * 50,
+            "Odoo Business Submission Failed",
+            f"Database ID : {record.id}",
+            f"Message Type: {record.message_type}",
+            f"Table       : {record.table_no}",
+            f"Model       : {record.model}",
+            f"Serial      : {record.serial}",
+            f"Retry Count : {record.retry_count}",
+            f"Error       : {error}",
+            f"Response    : {response_text}",
+            "Status      : FAILED",
+            "-" * 50,
+        ]
+    )
 
 
 def format_success_log(record: MessageRecord, response_text: str) -> str:

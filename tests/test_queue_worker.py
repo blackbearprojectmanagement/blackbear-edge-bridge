@@ -3,10 +3,14 @@ from __future__ import annotations
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from app.database import get_message_by_id, save_message
 from app.odoo_client import OdooAuthenticationError, OdooSubmissionError
 from app.queue_worker import OdooQueueWorker
+
+
+DEFAULT_RESPONSE = object()
 
 
 class FakeOdooClient:
@@ -15,7 +19,7 @@ class FakeOdooClient:
         *,
         authenticated: bool = True,
         fail_on: int | None = None,
-        response: object | None = None,
+        response: object = DEFAULT_RESPONSE,
     ) -> None:
         self.authenticated = authenticated
         self.fail_on = fail_on
@@ -36,9 +40,9 @@ class FakeOdooClient:
         self.submitted_payloads.append(payload)
         if self.fail_on == len(self.submitted_payloads):
             raise OdooSubmissionError("submission failed")
-        if self.response is not None:
+        if self.response is not DEFAULT_RESPONSE:
             return self.response
-        return {"accepted": payload}
+        return {"success": True, "result": {"accepted": payload}}
 
 
 class TestOdooQueueWorker(unittest.TestCase):
@@ -128,6 +132,53 @@ class TestOdooQueueWorker(unittest.TestCase):
             [{"MP": "Z106-015C020P001 7084T01"}],
         )
 
+    def test_successful_submission_logs_elapsed_timing(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
+        fake_client = FakeOdooClient(response={"success": True, "result": {"ok": True}})
+        worker = self._worker(fake_client)
+
+        with (
+            patch("app.queue_worker.time.monotonic", side_effect=[10.0, 10.125]),
+            self.assertLogs("app.queue_worker", level="INFO") as logs,
+        ):
+            worker.run_once()
+
+        log_text = "\n".join(logs.output)
+        self.assertIn("Odoo XML-RPC Submission Started", log_text)
+        self.assertIn(f"Database ID : {saved.id}", log_text)
+        self.assertIn("Message Type: MN", log_text)
+        self.assertIn("Model       : 106-020C012P001", log_text)
+        self.assertIn("Serial      : 3242", log_text)
+        self.assertIn("Table       : T01", log_text)
+        self.assertIn("Odoo XML-RPC Submission Finished", log_text)
+        self.assertIn(f"Database ID     : {saved.id}", log_text)
+        self.assertIn("Elapsed Seconds : 0.125000", log_text)
+        self.assertIn("Response        : {'success': True, 'result': {'ok': True}}", log_text)
+
+    def test_failed_submission_logs_elapsed_timing_before_failure_record(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
+        fake_client = FakeOdooClient(fail_on=1)
+        worker = self._worker(fake_client)
+
+        with (
+            patch("app.queue_worker.time.monotonic", side_effect=[20.0, 20.5]),
+            self.assertLogs("app.queue_worker", level="INFO") as logs,
+        ):
+            worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "FAILED")
+        log_text = "\n".join(logs.output)
+        self.assertIn("Odoo XML-RPC Submission Started", log_text)
+        self.assertIn("Odoo XML-RPC Submission Failed", log_text)
+        self.assertIn(f"Database ID     : {saved.id}", log_text)
+        self.assertIn("Elapsed Seconds : 0.500000", log_text)
+        self.assertIn("Error           : submission failed", log_text)
+        self.assertLess(
+            log_text.index("Odoo XML-RPC Submission Failed"),
+            log_text.index("Odoo Submission Failed"),
+        )
+
     def test_successful_odoo_ack_is_published_after_completed(self) -> None:
         saved = self._save_raw('{"MN":"106-020C012P001 3243T01"}', serial="3243")
         fake_client = FakeOdooClient(response={"success": True, "result": {"ACK": "3243"}})
@@ -151,14 +202,82 @@ class TestOdooQueueWorker(unittest.TestCase):
         self.assertEqual(published_acks, [])
 
     def test_success_false_does_not_publish(self) -> None:
-        self._save_raw('{"MN":"106-020C012P001 3243T01"}', serial="3243")
+        saved = self._save_raw('{"MN":"106-020C012P001 3243T01"}', serial="3243")
         fake_client = FakeOdooClient(response={"success": False, "result": {"ACK": "3243"}})
         published_acks: list[str] = []
         worker = self._worker(fake_client, ack_publisher=published_acks.append)
 
         worker.run_once()
 
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.retry_count, 1)
+        self.assertEqual(record.last_error, "Odoo business operation failed")
+        self.assertIn("'success': False", record.odoo_response)
         self.assertEqual(published_acks, [])
+
+    def test_business_failure_with_error_marks_failed_and_stores_response(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
+        response = {"success": False, "error": "No printer configured for table T01"}
+        fake_client = FakeOdooClient(response=response)
+        published_acks: list[str] = []
+        worker = self._worker(fake_client, ack_publisher=published_acks.append)
+
+        with self.assertLogs("app.queue_worker", level="INFO") as logs:
+            worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.retry_count, 1)
+        self.assertEqual(record.last_error, "No printer configured for table T01")
+        self.assertEqual(record.odoo_response, repr(response))
+        self.assertEqual(published_acks, [])
+
+        log_text = "\n".join(logs.output)
+        self.assertIn("Odoo Business Submission Failed", log_text)
+        self.assertIn("Retry Count : 1", log_text)
+        self.assertIn("Error       : No printer configured for table T01", log_text)
+        self.assertIn(f"Response    : {repr(response)}", log_text)
+
+    def test_business_failure_without_error_uses_fallback(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
+        fake_client = FakeOdooClient(response={"success": False})
+        published_acks: list[str] = []
+        worker = self._worker(fake_client, ack_publisher=published_acks.append)
+
+        worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.last_error, "Odoo business operation failed")
+        self.assertEqual(published_acks, [])
+
+    def test_none_response_marks_failed_without_ack(self) -> None:
+        self._assert_invalid_response_marks_failed(None)
+
+    def test_string_response_marks_failed_without_ack(self) -> None:
+        self._assert_invalid_response_marks_failed("unexpected")
+
+    def test_empty_dict_response_marks_failed_without_ack(self) -> None:
+        self._assert_invalid_response_marks_failed({})
+
+    def test_non_boolean_success_response_marks_failed(self) -> None:
+        self._assert_invalid_response_marks_failed({"success": "true"})
+
+    def test_retry_limit_still_respected_for_business_failures(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
+        fake_client = FakeOdooClient(response={"success": False, "error": "try later"})
+        worker = self._worker(fake_client, max_retries=1)
+
+        first_count = worker.run_once()
+        second_count = worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.retry_count, 1)
+        self.assertEqual(fake_client.submitted_payloads, [{"MN": "106-020C012P001 3242T01"}])
 
     def test_authentication_failure_does_not_claim_rows(self) -> None:
         saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
@@ -175,16 +294,32 @@ class TestOdooQueueWorker(unittest.TestCase):
         self,
         fake_client: FakeOdooClient,
         ack_publisher=None,
+        max_retries: int = 10,
     ) -> OdooQueueWorker:
         return OdooQueueWorker(
             database_path=self.database_path,
             odoo_client=fake_client,
             worker_interval=1,
             batch_size=10,
-            max_retries=10,
+            max_retries=max_retries,
             stale_processing_timeout=300,
             ack_publisher=ack_publisher,
         )
+
+    def _assert_invalid_response_marks_failed(self, response: object) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
+        fake_client = FakeOdooClient(response=response)
+        published_acks: list[str] = []
+        worker = self._worker(fake_client, ack_publisher=published_acks.append)
+
+        worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.retry_count, 1)
+        self.assertEqual(record.last_error, "Invalid Odoo response: missing success flag")
+        self.assertEqual(record.odoo_response, repr(response))
+        self.assertEqual(published_acks, [])
 
     def _save_raw(
         self,

@@ -554,8 +554,9 @@ def mark_failed(
     error: str,
     last_attempt_at: str,
     database_path: str | Path = DEFAULT_DATABASE_PATH,
+    odoo_response: str | None = None,
 ) -> None:
-    """Mark a queue row FAILED, incrementing retry_count and storing last_error."""
+    """Mark a queue row FAILED, incrementing retry_count and storing failure detail."""
     initialize_database(database_path)
 
     with _open_connection(database_path) as connection:
@@ -565,10 +566,11 @@ def mark_failed(
             SET status = ?,
                 retry_count = retry_count + 1,
                 last_error = ?,
-                last_attempt_at = ?
+                last_attempt_at = ?,
+                odoo_response = COALESCE(?, odoo_response)
             WHERE id = ?
             """,
-            ("FAILED", error, last_attempt_at, message_id),
+            ("FAILED", error, last_attempt_at, odoo_response, message_id),
         )
         if cursor.rowcount != 1:
             raise ValueError(f"Message id not found: {message_id}")
