@@ -48,7 +48,7 @@ class TestAckPublishing(unittest.TestCase):
         self.assertTrue(result)
         client.publish.assert_called_once_with(
             "MQTT/ODOO_TO_PLC/topic",
-            payload='{"ACK":"3243"}',
+            payload='{"ACK": "3243"}',
             qos=0,
             retain=False,
         )

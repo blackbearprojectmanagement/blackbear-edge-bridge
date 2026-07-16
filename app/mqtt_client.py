@@ -17,6 +17,7 @@ from app.message_parser import PLCMessageParseError, ParsedPLCMessage, parse_plc
 
 LOGGER = logging.getLogger(__name__)
 QOS = 0
+PLC_JSON_SEPARATORS = (",", ": ")
 
 
 MessageHandler = Callable[[ParsedPLCMessage], None]
@@ -101,7 +102,7 @@ class BEBMqttClient:
         """Publish an Odoo-style command payload to the PLC command topic."""
         payload: str | bytes
         if isinstance(command, Mapping):
-            payload = json.dumps(command, separators=(",", ":"))
+            payload = json.dumps(command, separators=PLC_JSON_SEPARATORS)
         else:
             payload = command
 
@@ -124,7 +125,7 @@ class BEBMqttClient:
     def publish_plc_command(self, payload: dict[str, str]) -> PublishResult:
         """Publish a validated PLC command to the configured command topic."""
         topic = self._config.mqtt_odoo_to_plc_topic
-        payload_text = json.dumps(payload, separators=(",", ":"))
+        payload_text = json.dumps(payload, separators=PLC_JSON_SEPARATORS)
 
         try:
             if not self._client.is_connected():
@@ -293,7 +294,7 @@ def format_received_message_log(
 
 def publish_ack(client: mqtt.Client, topic: str, ack: str) -> bool:
     """Publish an Odoo ACK response back to the PLC."""
-    payload = json.dumps({"ACK": ack}, separators=(",", ":"))
+    payload = json.dumps({"ACK": ack}, separators=PLC_JSON_SEPARATORS)
     LOGGER.info("\n%s", format_ack_publish_log(ack, topic))
 
     try:

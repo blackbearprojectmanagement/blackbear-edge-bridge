@@ -106,21 +106,21 @@ Supported PLC payloads:
 Supported Odoo-to-PLC API command payloads:
 
 ```json
-{"messt01":"Z106-020C012P001"}
-{"messt02":"Z106-020C012P001"}
-{"messt03":"Z106-020C012P001"}
-{"T01":"P"}
-{"T01":"R"}
-{"T01":"D"}
-{"T02":"P"}
-{"T02":"R"}
-{"T02":"D"}
-{"T03":"P"}
-{"T03":"R"}
-{"T03":"D"}
-{"LP":"FT01"}
-{"LP":"FT02"}
-{"LP":"FT03"}
+{"messt01": "Z106-020C012P001"}
+{"messt02": "Z106-020C012P001"}
+{"messt03": "Z106-020C012P001"}
+{"T01": "P"}
+{"T01": "R"}
+{"T01": "D"}
+{"T02": "P"}
+{"T02": "R"}
+{"T02": "D"}
+{"T03": "P"}
+{"T03": "R"}
+{"T03": "D"}
+{"LP": "FT01"}
+{"LP": "FT02"}
+{"LP": "FT03"}
 ```
 
 ## SQLite Queue
@@ -241,7 +241,7 @@ curl -u odoo:<password> \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: PRINTJOB-2960-T01" \
   -X POST \
-  -d '{"messt01":"Z106-020C012P001"}' \
+  -d '{"messt01": "Z106-020C012P001"}' \
   http://127.0.0.1:8000/api/v1/plc/command
 ```
 

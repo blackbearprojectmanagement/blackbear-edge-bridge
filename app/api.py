@@ -27,7 +27,7 @@ from app.database import (
     mark_api_command_rejected,
     save_api_response,
 )
-from app.mqtt_client import PublishResult
+from app.mqtt_client import PLC_JSON_SEPARATORS, PublishResult
 
 
 LOGGER = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ def create_api_app(
                 database_path=database_path,
             )
 
-        compact_payload = json.dumps(command, separators=(",", ":"))
+        plc_payload = json.dumps(command, separators=PLC_JSON_SEPARATORS)
         duplicate = _get_duplicate_response(
             idempotency_key,
             database_path,
@@ -148,7 +148,7 @@ def create_api_app(
                 idempotency_key=idempotency_key,
                 username=username,
                 remote_address=remote_address,
-                payload=compact_payload,
+                payload=plc_payload,
                 mqtt_topic=config.mqtt_odoo_to_plc_topic,
                 database_path=database_path,
             )
@@ -193,7 +193,7 @@ def create_api_app(
                     idempotency_key=idempotency_key,
                     username=username,
                     remote_address=remote_address,
-                    payload=compact_payload,
+                    payload=plc_payload,
                     topic=result.topic,
                     log_payload=config.beb_api_log_request_body,
                 ),

@@ -21,7 +21,7 @@ from app.database import (
     get_api_command_by_idempotency_key,
     initialize_api_commands_table,
 )
-from app.mqtt_client import BEBMqttClient, PublishResult
+from app.mqtt_client import BEBMqttClient, PLC_JSON_SEPARATORS, PublishResult
 
 
 class FakeMqttClient:
@@ -42,14 +42,14 @@ class FakeMqttClient:
 
     def publish_plc_command(self, payload: dict[str, str]) -> PublishResult:
         self.calls.append(payload)
-        compact = json.dumps(payload, separators=(",", ":"))
+        plc_payload = json.dumps(payload, separators=PLC_JSON_SEPARATORS)
         if not self.success:
             return PublishResult(
                 success=False,
                 rc=mqtt.MQTT_ERR_NO_CONN,
                 mid=None,
                 topic="MQTT/ODOO_TO_PLC/topic",
-                payload=compact,
+                payload=plc_payload,
                 error=self.error or "MQTT broker unavailable",
             )
         return PublishResult(
@@ -57,7 +57,7 @@ class FakeMqttClient:
             rc=mqtt.MQTT_ERR_SUCCESS,
             mid=12,
             topic="MQTT/ODOO_TO_PLC/topic",
-            payload=compact,
+            payload=plc_payload,
         )
 
 
@@ -259,6 +259,7 @@ class TestBebApi(ApiTestCase):
         )
         self.assertIsNotNone(record)
         self.assertEqual(record.status, "PUBLISHED")
+        self.assertEqual(record.payload, '{"messt01": "Z106-020C012P001"}')
         self.assertEqual(record.response_code, response.status_code)
         self.assertEqual(record.mqtt_mid, 12)
 
@@ -343,26 +344,39 @@ class TestBebApi(ApiTestCase):
 
 
 class TestMqttCommandPublishing(unittest.TestCase):
-    def test_correct_compact_json_topic_qos_and_retain(self) -> None:
-        config = make_config(Path("data/test_unused.db"))
-        client = BEBMqttClient.__new__(BEBMqttClient)
-        fake_paho = MagicMock()
-        fake_paho.is_connected.return_value = True
-        fake_paho.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_SUCCESS, mid=99)
-        client._config = config
-        client._client = fake_paho
+    def test_correct_plc_json_topic_qos_and_retain(self) -> None:
+        expected_payloads = [
+            ({"messt01": "S101-025C010P001"}, '{"messt01": "S101-025C010P001"}'),
+            ({"messt02": "S101-025C010P001"}, '{"messt02": "S101-025C010P001"}'),
+            ({"messt03": "S101-025C010P001"}, '{"messt03": "S101-025C010P001"}'),
+            ({"T01": "P"}, '{"T01": "P"}'),
+            ({"LP": "FT01"}, '{"LP": "FT01"}'),
+        ]
 
-        result = client.publish_plc_command({"messt01": "Z106-020C012P001"})
+        for command, expected_payload in expected_payloads:
+            with self.subTest(command=command):
+                config = make_config(Path("data/test_unused.db"))
+                client = BEBMqttClient.__new__(BEBMqttClient)
+                fake_paho = MagicMock()
+                fake_paho.is_connected.return_value = True
+                fake_paho.publish.return_value = SimpleNamespace(
+                    rc=mqtt.MQTT_ERR_SUCCESS,
+                    mid=99,
+                )
+                client._config = config
+                client._client = fake_paho
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.payload, '{"messt01":"Z106-020C012P001"}')
-        self.assertEqual(result.topic, "MQTT/ODOO_TO_PLC/topic")
-        fake_paho.publish.assert_called_once_with(
-            "MQTT/ODOO_TO_PLC/topic",
-            payload='{"messt01":"Z106-020C012P001"}',
-            qos=0,
-            retain=False,
-        )
+                result = client.publish_plc_command(command)
+
+                self.assertTrue(result.success)
+                self.assertEqual(result.payload, expected_payload)
+                self.assertEqual(result.topic, "MQTT/ODOO_TO_PLC/topic")
+                fake_paho.publish.assert_called_once_with(
+                    "MQTT/ODOO_TO_PLC/topic",
+                    payload=expected_payload,
+                    qos=0,
+                    retain=False,
+                )
 
     def test_publish_fails_cleanly_when_mqtt_disconnected(self) -> None:
         config = make_config(Path("data/test_unused.db"))
