@@ -192,6 +192,24 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(record.retry_count, 1)
         self.assertEqual(record.last_error, "network down")
 
+    def test_failed_row_can_store_odoo_response(self) -> None:
+        saved = self._save_sample_message()
+        claimed = claim_pending_messages(10, 10, self.database_path)[0]
+
+        mark_failed(
+            claimed.id,
+            "No printer configured for table T01",
+            "2026-07-15T00:00:00+00:00",
+            self.database_path,
+            odoo_response="{'success': False, 'error': 'No printer configured for table T01'}",
+        )
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.last_error, "No printer configured for table T01")
+        self.assertIn("'success': False", record.odoo_response)
+
     def test_max_retry_limit_is_respected(self) -> None:
         saved = self._save_sample_message()
         claimed = claim_pending_messages(10, 10, self.database_path)[0]
