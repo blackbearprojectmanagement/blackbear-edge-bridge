@@ -7,7 +7,7 @@ import logging
 import secrets
 import sqlite3
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -317,9 +317,9 @@ def _record_within_ttl(record: ApiCommandRecord, ttl_seconds: int) -> bool:
 
     received_at = datetime.fromisoformat(record.received_at)
     if received_at.tzinfo is None:
-        received_at = received_at.replace(tzinfo=UTC)
+        received_at = received_at.replace(tzinfo=timezone.utc)
 
-    return received_at >= datetime.now(UTC) - timedelta(seconds=ttl_seconds)
+    return received_at >= datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
 
 
 def _reject_request(

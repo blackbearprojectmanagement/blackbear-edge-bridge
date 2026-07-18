@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -195,7 +195,7 @@ def create_api_command_record(
         raise ValueError(f"Unsupported API command status: {status}")
 
     initialize_api_commands_table(database_path)
-    received_at_text = _format_timestamp(received_at or datetime.now(UTC))
+    received_at_text = _format_timestamp(received_at or datetime.now(timezone.utc))
     payload_hash = generate_api_payload_hash(payload)
 
     with _open_connection(database_path) as connection:
@@ -272,7 +272,7 @@ def mark_api_command_published(
         status="PUBLISHED",
         mqtt_rc=mqtt_rc,
         mqtt_mid=mqtt_mid,
-        published_at=_format_timestamp(published_at or datetime.now(UTC)),
+        published_at=_format_timestamp(published_at or datetime.now(timezone.utc)),
         last_error=None,
         database_path=database_path,
     )
@@ -350,7 +350,7 @@ def save_message(
 ) -> SavedMessage:
     """Persist a parsed MQTT message unless its topic/payload hash already exists."""
     initialize_database(database_path)
-    received_at_text = _format_timestamp(received_at or datetime.now(UTC))
+    received_at_text = _format_timestamp(received_at or datetime.now(timezone.utc))
     message_hash = generate_message_hash(topic, raw_payload)
 
     with _open_connection(database_path) as connection:
@@ -451,7 +451,7 @@ def update_status(
     initialize_database(database_path)
     processed_at_text = _format_timestamp(processed_at) if processed_at else None
     if status in {"COMPLETED", "FAILED"} and processed_at_text is None:
-        processed_at_text = _format_timestamp(datetime.now(UTC))
+        processed_at_text = _format_timestamp(datetime.now(timezone.utc))
 
     with _open_connection(database_path) as connection:
         cursor = connection.execute(
@@ -476,7 +476,7 @@ def claim_pending_messages(
     if batch_size <= 0:
         return []
 
-    last_attempt_at = _format_timestamp(datetime.now(UTC))
+    last_attempt_at = _format_timestamp(datetime.now(timezone.utc))
     connection = _connect(database_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -582,7 +582,7 @@ def reset_stale_processing(
 ) -> int:
     """Recover stale PROCESSING records left by an interrupted process."""
     initialize_database(database_path)
-    recovered_at = _format_timestamp(datetime.now(UTC))
+    recovered_at = _format_timestamp(datetime.now(timezone.utc))
 
     with _open_connection(database_path) as connection:
         cursor = connection.execute(
@@ -811,5 +811,5 @@ def _record_columns_sql() -> str:
 
 def _format_timestamp(value: datetime) -> str:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).isoformat(timespec="seconds")
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")

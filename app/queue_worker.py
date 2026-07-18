@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -58,7 +58,7 @@ class OdooQueueWorker:
                 LOGGER.warning("Odoo queue worker is already running")
                 return
 
-            stale_before = _timestamp(datetime.now(UTC) - timedelta(
+            stale_before = _timestamp(datetime.now(timezone.utc) - timedelta(
                 seconds=self._stale_processing_timeout
             ))
             recovered = reset_stale_processing(stale_before, self._database_path)
@@ -117,7 +117,7 @@ class OdooQueueWorker:
             self._stop_event.wait(self._worker_interval)
 
     def _process_record(self, record: MessageRecord) -> None:
-        last_attempt_at = _timestamp(datetime.now(UTC))
+        last_attempt_at = _timestamp(datetime.now(timezone.utc))
         try:
             payload = payload_from_record(record)
         except ValueError as exc:
@@ -149,7 +149,7 @@ class OdooQueueWorker:
             return
 
         elapsed_seconds = time.monotonic() - start_time
-        completed_at = _timestamp(datetime.now(UTC))
+        completed_at = _timestamp(datetime.now(timezone.utc))
         response_text = repr(response)
         LOGGER.info(
             "\n%s",
@@ -371,4 +371,4 @@ def format_failure_log(record: MessageRecord, error: str) -> str:
 
 
 def _timestamp(value: datetime) -> str:
-    return value.astimezone(UTC).isoformat(timespec="seconds")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
