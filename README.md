@@ -200,6 +200,7 @@ Retry behavior:
 - `mark_failed()` increments `retry_count`.
 - `PROCESSING` rows older than `ODOO_STALE_PROCESSING_SECONDS` are recovered as `FAILED` by an independent watchdog.
 - Recovered stale rows store `Recovered stale PROCESSING message after timeout` in `last_error`.
+- Timed-out `MN`/`MP` print records are terminal `FAILED` manual-verification records. They are not retried automatically and no ACK is published.
 
 ## Odoo XML-RPC
 
@@ -222,7 +223,7 @@ The object sent to Odoo is loaded from the original stored `raw_payload` and is 
 {"MP": "Z106-015C020P001 7084T01"}
 ```
 
-Any successful XML-RPC return marks the row `COMPLETED`. Faults, protocol errors, timeouts, and connection errors mark the row `FAILED` and allow later retry.
+Any successful XML-RPC return marks the row `COMPLETED`. Odoo print/inventory processing can intermittently take longer than 15 seconds, so the production recommended `ODOO_TIMEOUT` is 90 seconds. Timed-out `MN`/`MP` records are marked `FAILED` with manual verification required, are not retried automatically, and do not publish an ACK. Faults, protocol errors, and connection errors still mark the row `FAILED` and may allow later retry according to the retry policy.
 
 ## Authenticated Command API
 
@@ -278,7 +279,7 @@ ODOO_USERNAME=admin
 ODOO_PASSWORD=
 ODOO_MODEL=iot.configuration
 ODOO_SUBMIT_METHOD=xmlrpc_submit_print_data
-ODOO_TIMEOUT=15
+ODOO_TIMEOUT=90
 ODOO_WORKER_INTERVAL=2
 ODOO_BATCH_SIZE=10
 ODOO_MAX_RETRIES=10
@@ -329,7 +330,7 @@ ODOO_USERNAME=admin
 ODOO_PASSWORD=
 ODOO_MODEL=iot.configuration
 ODOO_SUBMIT_METHOD=xmlrpc_submit_print_data
-ODOO_TIMEOUT=15
+ODOO_TIMEOUT=90
 ODOO_WORKER_INTERVAL=2
 ODOO_BATCH_SIZE=10
 ODOO_MAX_RETRIES=10
