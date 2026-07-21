@@ -94,6 +94,17 @@ BEB to PLC : MQTT/ODOO_TO_PLC/topic
 
 BEB publishes Odoo-to-PLC API commands to the PLC command topic with QoS 0 and retain disabled.
 
+BEB can also publish its own Odoo-path readiness status to the PLC-bound topic configured by `BEB_READY_TOPIC`, which defaults to the existing `MQTT/ODOO_TO_PLC/topic`. The readiness payload is compact JSON and contains only the `BR` key:
+
+```json
+{"BR":1}
+{"BR":0}
+```
+
+`{"BR":1}` means BEB has confirmed that the Odoo XML-RPC path is reachable and authenticating. `{"BR":0}` means BEB cannot currently confirm that path. This is an operational readiness signal for PLC logic such as M200; it is not a safety interlock. BEB publishes `BR` only on confirmed state changes, never as a continuous heartbeat.
+
+At startup the readiness state is unknown/not ready. BEB publishes `BR=1` only after 10 seconds of continuous successful Odoo checks. If the first check fails, BEB publishes `BR=0` once. From READY, failures must continue for 5 seconds before BEB publishes `BR=0`; from NOT_READY, successes must continue for 10 seconds before BEB publishes `BR=1`. Brief opposite results reset the active debounce timer. Each readiness check uses the short `BEB_READY_CHECK_TIMEOUT_SECONDS` timeout, default `3` seconds, for both `common.version()` and authentication. It does not inherit the production print/inventory `ODOO_TIMEOUT=90`.
+
 Supported PLC payloads:
 
 ```json
@@ -235,6 +246,23 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
+The health response preserves the existing fields and also reports worker and readiness state. Readiness fields are:
+
+```text
+beb_ready_enabled
+beb_ready_state
+beb_ready_check_timeout_seconds
+beb_ready_last_check_at
+beb_ready_last_success_at
+beb_ready_last_failure_at
+beb_ready_last_published_at
+beb_ready_last_error
+beb_ready_disconnect_elapsed_seconds
+beb_ready_recovery_elapsed_seconds
+```
+
+When readiness is enabled and the confirmed state is not `READY`, `/health` reports a degraded status. Readiness checks do not stop the queue worker, do not submit print/inventory business messages, and do not alter ACK or timeout handling.
+
 Publish command:
 
 ```bash
@@ -294,6 +322,12 @@ BEB_API_REQUEST_TIMEOUT=10
 BEB_API_IDEMPOTENCY_TTL_SECONDS=86400
 BEB_API_MAX_BODY_BYTES=16384
 BEB_API_LOG_REQUEST_BODY=true
+BEB_READY_ENABLED=true
+BEB_READY_CHECK_INTERVAL_SECONDS=1
+BEB_READY_CHECK_TIMEOUT_SECONDS=3
+BEB_READY_DISCONNECT_DELAY_SECONDS=5
+BEB_READY_RECOVERY_DELAY_SECONDS=10
+BEB_READY_TOPIC=MQTT/ODOO_TO_PLC/topic
 ```
 
 The real `.env` file is ignored by Git. Do not print or log `ODOO_PASSWORD`.
@@ -346,6 +380,12 @@ BEB_API_REQUEST_TIMEOUT=10
 BEB_API_IDEMPOTENCY_TTL_SECONDS=86400
 BEB_API_MAX_BODY_BYTES=16384
 BEB_API_LOG_REQUEST_BODY=true
+BEB_READY_ENABLED=true
+BEB_READY_CHECK_INTERVAL_SECONDS=1
+BEB_READY_CHECK_TIMEOUT_SECONDS=3
+BEB_READY_DISCONNECT_DELAY_SECONDS=5
+BEB_READY_RECOVERY_DELAY_SECONDS=10
+BEB_READY_TOPIC=MQTT/ODOO_TO_PLC/topic
 ```
 
 ## Windows Development

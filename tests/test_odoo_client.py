@@ -227,6 +227,36 @@ class TestOdooXmlRpcClient(unittest.TestCase):
         self.assertIsNone(self.client._models)
         self.assertIsNone(self.client._uid)
 
+    @patch("app.odoo_client.xmlrpc.client.ServerProxy")
+    def test_readiness_check_uses_version_and_authentication(self, server_proxy) -> None:
+        common = MagicMock()
+        common.version.return_value = {"server_version": "18.0"}
+        common.authenticate.return_value = 7
+        server_proxy.return_value = common
+
+        self.assertTrue(self.client.check_readiness())
+
+        common.version.assert_called_once_with()
+        common.authenticate.assert_called_once_with(
+            "broadtechit-test-bbw-stage-34933250",
+            "admin",
+            "secret",
+            {},
+        )
+
+    @patch("app.odoo_client.xmlrpc.client.ServerProxy")
+    def test_readiness_check_resets_proxy_after_transport_failure(self, server_proxy) -> None:
+        common = MagicMock()
+        common.version.side_effect = socket.timeout("timed out")
+        server_proxy.return_value = common
+
+        with self.assertRaises(OdooAuthenticationError):
+            self.client.check_readiness()
+
+        self.assertIsNone(self.client._common)
+        self.assertIsNone(self.client._models)
+        self.assertIsNone(self.client._uid)
+
 
 if __name__ == "__main__":
     unittest.main()

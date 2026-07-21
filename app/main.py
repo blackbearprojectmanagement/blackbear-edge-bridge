@@ -12,6 +12,7 @@ from app.database import initialize_api_commands_table, initialize_database
 from app.mqtt_client import BEBMqttClient
 from app.odoo_client import OdooXmlRpcClient
 from app.queue_worker import OdooQueueWorker
+from app.readiness import ReadinessMonitor
 
 
 def configure_logging(config: AppConfig) -> None:
@@ -53,6 +54,46 @@ def create_odoo_worker(
     return worker, odoo_client
 
 
+def create_readiness_monitor(
+    config: AppConfig,
+    mqtt_client: BEBMqttClient,
+) -> tuple[ReadinessMonitor, OdooXmlRpcClient | None]:
+    enabled = config.beb_ready_enabled and config.odoo_enabled
+    if not enabled:
+        monitor = ReadinessMonitor(
+            enabled=False,
+            check_interval_seconds=config.beb_ready_check_interval_seconds,
+            check_timeout_seconds=config.beb_ready_check_timeout_seconds,
+            disconnect_delay_seconds=config.beb_ready_disconnect_delay_seconds,
+            recovery_delay_seconds=config.beb_ready_recovery_delay_seconds,
+            topic=config.beb_ready_topic,
+            readiness_check=lambda: False,
+            publisher=mqtt_client.publish_readiness,
+        )
+        return monitor, None
+
+    readiness_odoo_client = OdooXmlRpcClient(
+        url=config.odoo_url,
+        database=config.odoo_database,
+        username=config.odoo_username,
+        password=config.odoo_password,
+        model=config.odoo_model,
+        submit_method=config.odoo_submit_method,
+        timeout=config.beb_ready_check_timeout_seconds,
+    )
+    monitor = ReadinessMonitor(
+        enabled=True,
+        check_interval_seconds=config.beb_ready_check_interval_seconds,
+        check_timeout_seconds=config.beb_ready_check_timeout_seconds,
+        disconnect_delay_seconds=config.beb_ready_disconnect_delay_seconds,
+        recovery_delay_seconds=config.beb_ready_recovery_delay_seconds,
+        topic=config.beb_ready_topic,
+        readiness_check=readiness_odoo_client.check_readiness,
+        publisher=mqtt_client.publish_readiness,
+    )
+    return monitor, readiness_odoo_client
+
+
 def main() -> None:
     config = load_config()
     configure_logging(config)
@@ -67,21 +108,33 @@ def main() -> None:
         worker, odoo_client = worker_bundle
         worker.start()
 
-    api_server = BebApiServer(config, client, config.database_path, worker)
+    readiness_monitor, readiness_odoo_client = create_readiness_monitor(config, client)
+
+    api_server = BebApiServer(
+        config,
+        client,
+        config.database_path,
+        worker,
+        readiness_monitor,
+    )
 
     try:
         client.start_loop()
+        readiness_monitor.start()
         api_server.start()
         threading.Event().wait()
     except KeyboardInterrupt:
         logging.getLogger(__name__).info("Ctrl+C received")
     finally:
+        readiness_monitor.stop()
         api_server.stop()
         if worker is not None:
             worker.stop()
         client.shutdown()
         if odoo_client is not None:
             odoo_client.close()
+        if readiness_odoo_client is not None:
+            readiness_odoo_client.close()
 
 
 if __name__ == "__main__":

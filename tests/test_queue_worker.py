@@ -485,6 +485,14 @@ class TestOdooQueueWorker(unittest.TestCase):
             if time.monotonic() > deadline:
                 self.fail("worker did not start processing the hung record")
             time.sleep(0.05)
+        while True:
+            with worker._active_submission_lock:
+                process = worker._active_submission_process
+            if process is not None and process.is_alive():
+                break
+            if time.monotonic() > deadline:
+                self.fail("worker did not register the hung child process")
+            time.sleep(0.05)
 
         stop_started = time.monotonic()
         worker.stop()

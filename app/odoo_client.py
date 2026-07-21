@@ -115,6 +115,21 @@ class OdooXmlRpcClient:
         except OdooAuthenticationError as exc:
             raise OdooSubmissionError(str(exc)) from exc
 
+    def check_readiness(self) -> bool:
+        """Verify Odoo XML-RPC and database authentication without business effects."""
+        try:
+            common = self._get_common_proxy()
+            version = common.version()
+            if not isinstance(version, dict):
+                return False
+            self.authenticate()
+            return True
+        except OdooAuthenticationError:
+            raise
+        except _ODOO_TRANSPORT_ERRORS as exc:
+            self.close()
+            raise OdooAuthenticationError(f"Odoo readiness check failed: {exc}") from exc
+
     def is_authenticated(self) -> bool:
         return self._uid is not None and self._uid > 0
 

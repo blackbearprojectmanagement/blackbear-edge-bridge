@@ -24,6 +24,7 @@ from app.database import (
     update_status,
 )
 from app.mqtt_client import BEBMqttClient, PLC_JSON_SEPARATORS, PublishResult
+from app.readiness import ReadinessSnapshot
 
 
 class FakeMqttClient:
@@ -81,6 +82,28 @@ class FakeWorker:
         }
 
 
+class FakeReadinessMonitor:
+    def __init__(self, state: str, *, enabled: bool = True) -> None:
+        self.state = state
+        self.enabled = enabled
+
+    def snapshot(self) -> ReadinessSnapshot:
+        return ReadinessSnapshot(
+            enabled=self.enabled,
+            state=self.state,
+            check_timeout_seconds=3,
+            last_check_at="2026-07-21T10:00:01+00:00",
+            last_success_at="2026-07-21T10:00:01+00:00"
+            if self.state == "READY"
+            else None,
+            last_failure_at=None if self.state == "READY" else "2026-07-21T10:00:01+00:00",
+            last_published_at="2026-07-21T10:00:02+00:00",
+            last_error=None if self.state == "READY" else "Odoo unavailable",
+            disconnect_elapsed_seconds=None,
+            recovery_elapsed_seconds=None,
+        )
+
+
 def make_config(database_path: Path, **overrides: object) -> AppConfig:
     values = {
         "mqtt_host": "localhost",
@@ -112,6 +135,7 @@ def make_config(database_path: Path, **overrides: object) -> AppConfig:
         "beb_api_idempotency_ttl_seconds": 86400,
         "beb_api_max_body_bytes": 16384,
         "beb_api_log_request_body": True,
+        "beb_ready_enabled": False,
     }
     values.update(overrides)
     return AppConfig(**values)
@@ -136,6 +160,7 @@ class ApiTestCase(unittest.TestCase):
         self,
         mqtt_client: FakeMqttClient | None = None,
         odoo_worker: object | None = None,
+        readiness_monitor: object | None = None,
         **config_overrides: object,
     ) -> tuple[TestClient, FakeMqttClient]:
         config = make_config(self.database_path, **config_overrides)
@@ -147,6 +172,7 @@ class ApiTestCase(unittest.TestCase):
                     fake_mqtt,
                     self.database_path,
                     odoo_worker,
+                    readiness_monitor,
                 )
             ),
             fake_mqtt,
@@ -189,6 +215,9 @@ class TestBebApi(ApiTestCase):
         self.assertIn("queue_processing_count", response.json())
         self.assertIn("queue_failed_count", response.json())
         self.assertIn("queue_completed_count", response.json())
+        self.assertIn("beb_ready_enabled", response.json())
+        self.assertIn("beb_ready_state", response.json())
+        self.assertIn("beb_ready_check_timeout_seconds", response.json())
 
     def test_health_degrades_when_worker_unhealthy(self) -> None:
         client, _ = self.make_client(odoo_worker=FakeWorker(healthy=False))
@@ -213,6 +242,34 @@ class TestBebApi(ApiTestCase):
         self.assertTrue(body["worker_healthy"])
         self.assertEqual(body["queue_new_count"], 1)
         self.assertEqual(body["queue_completed_count"], 1)
+
+    def test_health_reports_readiness_ready_state(self) -> None:
+        client, _ = self.make_client(
+            odoo_worker=FakeWorker(healthy=True),
+            readiness_monitor=FakeReadinessMonitor("READY"),
+            beb_ready_enabled=True,
+        )
+
+        body = client.get("/health").json()
+
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["beb_ready_enabled"])
+        self.assertEqual(body["beb_ready_state"], "READY")
+        self.assertEqual(body["beb_ready_check_timeout_seconds"], 3)
+        self.assertEqual(body["beb_ready_last_success_at"], "2026-07-21T10:00:01+00:00")
+
+    def test_health_degrades_when_readiness_not_ready(self) -> None:
+        client, _ = self.make_client(
+            odoo_worker=FakeWorker(healthy=True),
+            readiness_monitor=FakeReadinessMonitor("NOT_READY"),
+            beb_ready_enabled=True,
+        )
+
+        body = client.get("/health").json()
+
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["beb_ready_state"], "NOT_READY")
+        self.assertEqual(body["beb_ready_last_error"], "Odoo unavailable")
 
     def test_health_reports_database_queue_counts_without_worker(self) -> None:
         saved_new = save_message(

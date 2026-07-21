@@ -41,6 +41,12 @@ class AppConfig:
     beb_api_idempotency_ttl_seconds: int = 86400
     beb_api_max_body_bytes: int = 16384
     beb_api_log_request_body: bool = True
+    beb_ready_enabled: bool = True
+    beb_ready_check_interval_seconds: int = 1
+    beb_ready_check_timeout_seconds: int = 3
+    beb_ready_disconnect_delay_seconds: int = 5
+    beb_ready_recovery_delay_seconds: int = 10
+    beb_ready_topic: str = "MQTT/ODOO_TO_PLC/topic"
 
 
 def _get_int(name: str, default: int) -> int:
@@ -96,7 +102,7 @@ def load_config() -> AppConfig:
         odoo_submit_method=os.getenv(
             "ODOO_SUBMIT_METHOD", "xmlrpc_submit_print_data"
         ),
-        odoo_timeout=_get_int("ODOO_TIMEOUT", 15),
+        odoo_timeout=_get_int("ODOO_TIMEOUT", 90),
         odoo_worker_interval=_get_int("ODOO_WORKER_INTERVAL", 2),
         odoo_batch_size=_get_int("ODOO_BATCH_SIZE", 10),
         odoo_max_retries=_get_int("ODOO_MAX_RETRIES", 10),
@@ -117,4 +123,20 @@ def load_config() -> AppConfig:
         ),
         beb_api_max_body_bytes=_get_int("BEB_API_MAX_BODY_BYTES", 16384),
         beb_api_log_request_body=_get_bool("BEB_API_LOG_REQUEST_BODY", True),
+        beb_ready_enabled=_get_bool("BEB_READY_ENABLED", True),
+        beb_ready_check_interval_seconds=_get_int(
+            "BEB_READY_CHECK_INTERVAL_SECONDS", 1
+        ),
+        beb_ready_check_timeout_seconds=_get_int(
+            "BEB_READY_CHECK_TIMEOUT_SECONDS", 3
+        ),
+        beb_ready_disconnect_delay_seconds=_get_int(
+            "BEB_READY_DISCONNECT_DELAY_SECONDS", 5
+        ),
+        beb_ready_recovery_delay_seconds=_get_int(
+            "BEB_READY_RECOVERY_DELAY_SECONDS", 10
+        ),
+        beb_ready_topic=os.getenv(
+            "BEB_READY_TOPIC", "MQTT/ODOO_TO_PLC/topic"
+        ),
     )

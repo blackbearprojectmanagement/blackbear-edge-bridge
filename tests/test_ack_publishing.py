@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import paho.mqtt.client as mqtt
 
-from app.mqtt_client import publish_ack
+from app.mqtt_client import publish_ack, publish_readiness
 from app.queue_worker import extract_ack
 
 
@@ -60,6 +60,21 @@ class TestAckPublishing(unittest.TestCase):
         result = publish_ack(client, "MQTT/ODOO_TO_PLC/topic", "3243")
 
         self.assertFalse(result)
+
+    def test_readiness_publish_uses_compact_br_payload(self) -> None:
+        client = MagicMock()
+        client.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_SUCCESS, mid=11)
+
+        result = publish_readiness(client, "MQTT/ODOO_TO_PLC/topic", 1)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.payload, '{"BR":1}')
+        client.publish.assert_called_once_with(
+            "MQTT/ODOO_TO_PLC/topic",
+            payload='{"BR":1}',
+            qos=0,
+            retain=False,
+        )
 
 
 if __name__ == "__main__":

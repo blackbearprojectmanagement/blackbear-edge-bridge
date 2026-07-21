@@ -40,6 +40,7 @@ def create_api_app(
     mqtt_client: Any,
     database_path: str | Path,
     odoo_worker: Any | None = None,
+    readiness_monitor: Any | None = None,
 ) -> FastAPI:
     """Create the BEB FastAPI application."""
     initialize_api_commands_table(database_path)
@@ -67,8 +68,11 @@ def create_api_app(
     @app.get("/health")
     def health() -> dict[str, object]:
         worker_health = _worker_health(config, odoo_worker, database_path)
+        readiness_health = _readiness_health(config, readiness_monitor)
         status = "ok"
         if config.odoo_enabled and not worker_health["worker_healthy"]:
+            status = "degraded"
+        if readiness_health["beb_ready_enabled"] and readiness_health["beb_ready_state"] != "READY":
             status = "degraded"
 
         return {
@@ -78,6 +82,7 @@ def create_api_app(
             "odoo_enabled": config.odoo_enabled,
             "api_enabled": config.beb_api_enabled,
             **worker_health,
+            **readiness_health,
         }
 
     @app.post("/api/v1/plc/command")
@@ -312,6 +317,41 @@ def _worker_health(
         "queue_processing_count": counts.get("PROCESSING", 0),
         "queue_failed_count": counts.get("FAILED", 0),
         "queue_completed_count": counts.get("COMPLETED", 0),
+    }
+
+
+def _readiness_health(
+    config: AppConfig,
+    readiness_monitor: Any | None,
+) -> dict[str, object]:
+    if readiness_monitor is not None:
+        snapshot = getattr(readiness_monitor, "snapshot", None)
+        if callable(snapshot):
+            value = snapshot()
+            return {
+                "beb_ready_enabled": bool(value.enabled),
+                "beb_ready_state": value.state,
+                "beb_ready_check_timeout_seconds": value.check_timeout_seconds,
+                "beb_ready_last_check_at": value.last_check_at,
+                "beb_ready_last_success_at": value.last_success_at,
+                "beb_ready_last_failure_at": value.last_failure_at,
+                "beb_ready_last_published_at": value.last_published_at,
+                "beb_ready_last_error": value.last_error,
+                "beb_ready_disconnect_elapsed_seconds": value.disconnect_elapsed_seconds,
+                "beb_ready_recovery_elapsed_seconds": value.recovery_elapsed_seconds,
+            }
+
+    return {
+        "beb_ready_enabled": config.beb_ready_enabled,
+        "beb_ready_state": "UNKNOWN" if config.beb_ready_enabled else "DISABLED",
+        "beb_ready_check_timeout_seconds": config.beb_ready_check_timeout_seconds,
+        "beb_ready_last_check_at": None,
+        "beb_ready_last_success_at": None,
+        "beb_ready_last_failure_at": None,
+        "beb_ready_last_published_at": None,
+        "beb_ready_last_error": None,
+        "beb_ready_disconnect_elapsed_seconds": None,
+        "beb_ready_recovery_elapsed_seconds": None,
     }
 
 

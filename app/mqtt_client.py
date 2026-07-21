@@ -176,6 +176,10 @@ class BEBMqttClient:
         """Publish an ACK payload to the PLC command topic."""
         return publish_ack(self._client, self._config.mqtt_odoo_to_plc_topic, ack)
 
+    def publish_readiness(self, br_value: int) -> PublishResult:
+        """Publish a BEB readiness BR payload to the PLC command topic."""
+        return publish_readiness(self._client, self._config.beb_ready_topic, br_value)
+
     def _on_connect(
         self,
         client: mqtt.Client,
@@ -392,6 +396,39 @@ def publish_ack(client: mqtt.Client, topic: str, ack: str) -> bool:
 
     LOGGER.info("\n%s", format_ack_publish_success_log(ack))
     return True
+
+
+def publish_readiness(client: mqtt.Client, topic: str, br_value: int) -> PublishResult:
+    """Publish compact BEB readiness payload to the PLC command topic."""
+    payload = json.dumps({"BR": br_value}, separators=(",", ":"))
+    try:
+        info = client.publish(topic, payload=payload, qos=QOS, retain=False)
+    except Exception as exc:
+        LOGGER.error("BR publish failure topic=%s payload=%s error=%s", topic, payload, exc)
+        return PublishResult(
+            success=False,
+            rc=mqtt.MQTT_ERR_UNKNOWN,
+            mid=None,
+            topic=topic,
+            payload=payload,
+            error=str(exc),
+        )
+
+    rc = int(info.rc)
+    success = rc == mqtt.MQTT_ERR_SUCCESS
+    if success:
+        LOGGER.info("BR payload published topic=%s payload=%s", topic, payload)
+    else:
+        LOGGER.error("BR publish failure topic=%s payload=%s rc=%s", topic, payload, rc)
+
+    return PublishResult(
+        success=success,
+        rc=rc,
+        mid=int(info.mid) if getattr(info, "mid", None) is not None else None,
+        topic=topic,
+        payload=payload,
+        error=None if success else f"MQTT publish rc={rc}",
+    )
 
 
 def format_ack_publish_log(ack: str, topic: str) -> str:
