@@ -25,6 +25,12 @@ from app.odoo_client import OdooAuthenticationError, OdooSubmissionError, OdooXm
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_MESSAGE_TYPES = frozenset({"MN", "MP"})
 SUPPORTED_TABLES = frozenset({"T01", "T02", "T03"})
+STALE_RECOVERY_INTERVAL_SECONDS = 30
+NON_RETRYABLE_BUSINESS_ERRORS = frozenset(
+    {
+        "Nothing to check the availability for.",
+    }
+)
 
 
 class OdooQueueWorker:
@@ -50,6 +56,7 @@ class OdooQueueWorker:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._last_stale_recovery_at: datetime | None = None
 
     def start(self) -> None:
         """Start the queue worker thread once."""
@@ -62,6 +69,7 @@ class OdooQueueWorker:
                 seconds=self._stale_processing_timeout
             ))
             recovered = reset_stale_processing(stale_before, self._database_path)
+            self._last_stale_recovery_at = datetime.now(timezone.utc)
             if recovered:
                 LOGGER.warning("Recovered %s stale PROCESSING message(s)", recovered)
 
@@ -89,6 +97,8 @@ class OdooQueueWorker:
 
     def run_once(self) -> int:
         """Process one worker batch and return the number of records attempted."""
+        self._recover_stale_processing_if_due()
+
         if not self._odoo_client.is_authenticated():
             try:
                 self._odoo_client.authenticate()
@@ -150,7 +160,7 @@ class OdooQueueWorker:
 
         elapsed_seconds = time.monotonic() - start_time
         completed_at = _timestamp(datetime.now(timezone.utc))
-        response_text = repr(response)
+        response_text = json.dumps(response)
         LOGGER.info(
             "\n%s",
             format_xmlrpc_submission_finished_log(record, elapsed_seconds, response_text),
@@ -158,11 +168,13 @@ class OdooQueueWorker:
 
         business_error = get_odoo_business_error(response)
         if business_error is not None:
+            retryable = not is_non_retryable_business_error(business_error)
             failed_record = self._mark_record_failed(
                 record,
                 business_error,
                 last_attempt_at,
                 odoo_response=response_text,
+                retryable=retryable,
             )
             LOGGER.error(
                 "\n%s",
@@ -170,21 +182,54 @@ class OdooQueueWorker:
             )
             return
 
-        mark_completed(record.id, response_text, completed_at, self._database_path)
-        LOGGER.info("\n%s", format_success_log(record, response_text))
-        self._publish_ack_if_available(response)
-
-    def _publish_ack_if_available(self, response: object) -> None:
         ack = extract_ack(response)
         if ack is None:
-            LOGGER.warning("Odoo response did not contain a publishable ACK; ACK not sent")
+            error = "Odoo response success=true but missing or invalid ACK"
+            failed_record = self._mark_record_failed(
+                record,
+                error,
+                last_attempt_at,
+                odoo_response=response_text,
+                retryable=False,
+            )
+            LOGGER.error("\n%s", format_failure_log(failed_record, error))
             return
 
+        metadata = extract_dashboard_metadata(response)
+        mark_completed(
+            record.id,
+            response_text,
+            completed_at,
+            self._database_path,
+            ack=ack,
+            **metadata,
+        )
+        LOGGER.info("\n%s", format_success_log(record, response_text))
+        self._publish_ack(ack)
+
+    def _publish_ack(self, ack: str) -> None:
         if self._ack_publisher is None:
             LOGGER.warning("ACK %s received from Odoo but no MQTT ACK publisher is configured", ack)
             return
 
         self._ack_publisher(ack)
+
+    def _recover_stale_processing_if_due(self) -> int:
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_stale_recovery_at is not None
+            and now - self._last_stale_recovery_at
+            < timedelta(seconds=STALE_RECOVERY_INTERVAL_SECONDS)
+        ):
+            return 0
+
+        stale_before = _timestamp(
+            now - timedelta(seconds=self._stale_processing_timeout)
+        )
+        recovered = reset_stale_processing(stale_before, self._database_path)
+        self._last_stale_recovery_at = now
+        LOGGER.info("Runtime stale PROCESSING recovery recovered %s row(s)", recovered)
+        return recovered
 
     def _mark_record_failed(
         self,
@@ -192,6 +237,8 @@ class OdooQueueWorker:
         error: str,
         last_attempt_at: str,
         odoo_response: str | None = None,
+        *,
+        retryable: bool = True,
     ) -> MessageRecord:
         mark_failed(
             record.id,
@@ -199,11 +246,16 @@ class OdooQueueWorker:
             last_attempt_at,
             self._database_path,
             odoo_response=odoo_response,
+            retryable=retryable,
+            max_retries=self._max_retries,
         )
+        retry_count = record.retry_count + 1
+        if not retryable:
+            retry_count = max(retry_count, self._max_retries)
         return replace(
             record,
             status="FAILED",
-            retry_count=record.retry_count + 1,
+            retry_count=retry_count,
             last_error=error,
             last_attempt_at=last_attempt_at,
             odoo_response=odoo_response if odoo_response is not None else record.odoo_response,
@@ -248,6 +300,27 @@ def extract_ack(response: object) -> str | None:
     return ack if isinstance(ack, str) and ack else None
 
 
+def extract_dashboard_metadata(response: object) -> dict[str, object | None]:
+    """Return structured dashboard fields from a successful Odoo response."""
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict):
+        return {
+            "customer_id": None,
+            "customer_name": None,
+            "operator_id": None,
+            "operator_name": None,
+            "batch_number": None,
+        }
+
+    return {
+        "customer_id": _optional_int(result.get("customer_id")),
+        "customer_name": _optional_str(result.get("customer_name")),
+        "operator_id": _optional_int(result.get("operator_id")),
+        "operator_name": _optional_str(result.get("operator_name")),
+        "batch_number": _optional_str(result.get("batch_number")),
+    }
+
+
 def get_odoo_business_error(response: object) -> str | None:
     """Return an error string when an XML-RPC response is not a business success."""
     if not isinstance(response, Mapping):
@@ -263,6 +336,11 @@ def get_odoo_business_error(response: object) -> str | None:
         return "Odoo business operation failed"
 
     return "Invalid Odoo response: missing success flag"
+
+
+def is_non_retryable_business_error(error: str) -> bool:
+    """Return whether a business failure should be finalized immediately."""
+    return error.strip() in NON_RETRYABLE_BUSINESS_ERRORS
 
 
 def format_xmlrpc_submission_started_log(record: MessageRecord) -> str:
@@ -372,3 +450,11 @@ def format_failure_log(record: MessageRecord, error: str) -> str:
 
 def _timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None

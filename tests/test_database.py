@@ -4,12 +4,15 @@ import sqlite3
 import unittest
 import uuid
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.database import (
+    ACK_REPLAY_MAX_COUNT,
     claim_pending_messages,
     generate_message_hash,
     get_message_by_id,
+    get_message_by_hash,
     get_pending_messages,
     initialize_database,
     mark_completed,
@@ -107,6 +110,14 @@ class TestDatabase(unittest.TestCase):
         self.assertIn("odoo_response", columns)
         self.assertIn("last_attempt_at", columns)
         self.assertIn("completed_at", columns)
+        self.assertIn("ack", columns)
+        self.assertIn("customer_id", columns)
+        self.assertIn("customer_name", columns)
+        self.assertIn("operator_id", columns)
+        self.assertIn("operator_name", columns)
+        self.assertIn("batch_number", columns)
+        self.assertIn("ack_replay_count", columns)
+        self.assertIn("last_ack_replayed_at", columns)
         self.assertEqual(count, 1)
 
     def test_insert_message(self) -> None:
@@ -180,6 +191,78 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(record.completed_at, "2026-07-15T00:00:00+00:00")
         self.assertIsNone(record.last_error)
 
+    def test_successful_row_stores_dashboard_metadata(self) -> None:
+        saved = self._save_sample_message()
+        claimed = claim_pending_messages(10, 10, self.database_path)[0]
+
+        mark_completed(
+            claimed.id,
+            '{"success": true, "result": {"ACK": "3241"}}',
+            "2026-07-15T00:00:00+00:00",
+            self.database_path,
+            ack="3241",
+            customer_id=145,
+            customer_name="Mahindra",
+            operator_id=27,
+            operator_name="Arun",
+            batch_number="BATCH-20260720-01",
+        )
+
+        record = get_message_by_hash(saved.message_hash, self.database_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.ack, "3241")
+        self.assertEqual(record.customer_id, 145)
+        self.assertEqual(record.customer_name, "Mahindra")
+        self.assertEqual(record.operator_id, 27)
+        self.assertEqual(record.operator_name, "Arun")
+        self.assertEqual(record.batch_number, "BATCH-20260720-01")
+        self.assertEqual(record.ack_replay_count, 0)
+        self.assertIsNone(record.last_ack_replayed_at)
+
+    def test_ack_replay_attempt_enforces_limit_interval_and_window(self) -> None:
+        from app.database import record_ack_replay_attempt
+
+        saved = self._save_sample_message()
+        base = datetime.fromisoformat("2026-07-21T10:00:00+00:00")
+
+        first = record_ack_replay_attempt(saved.message_hash, self.database_path, base)
+        too_soon = record_ack_replay_attempt(
+            saved.message_hash,
+            self.database_path,
+            base + timedelta(seconds=1),
+        )
+        second = record_ack_replay_attempt(
+            saved.message_hash,
+            self.database_path,
+            base + timedelta(seconds=2),
+        )
+        third = record_ack_replay_attempt(
+            saved.message_hash,
+            self.database_path,
+            base + timedelta(seconds=4),
+        )
+        limited = record_ack_replay_attempt(
+            saved.message_hash,
+            self.database_path,
+            base + timedelta(seconds=6),
+        )
+        reset = record_ack_replay_attempt(
+            saved.message_hash,
+            self.database_path,
+            base + timedelta(seconds=35),
+        )
+
+        self.assertTrue(first.allowed)
+        self.assertFalse(too_soon.allowed)
+        self.assertEqual(too_soon.reason, "minimum-interval")
+        self.assertTrue(second.allowed)
+        self.assertTrue(third.allowed)
+        self.assertFalse(limited.allowed)
+        self.assertEqual(limited.reason, "replay-limit-reached")
+        self.assertEqual(limited.replay_count, ACK_REPLAY_MAX_COUNT)
+        self.assertTrue(reset.allowed)
+        self.assertEqual(reset.replay_count, 1)
+
     def test_failed_row_becomes_failed_and_retry_count_increments(self) -> None:
         saved = self._save_sample_message()
         claimed = claim_pending_messages(10, 10, self.database_path)[0]
@@ -233,7 +316,7 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(record.retry_count, 1)
         self.assertEqual(
             record.last_error,
-            "Recovered stale PROCESSING message after application restart",
+            "Recovered stale PROCESSING message after timeout",
         )
 
     def _save_sample_message(self):

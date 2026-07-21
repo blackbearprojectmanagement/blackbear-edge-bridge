@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from collections.abc import Mapping
@@ -12,7 +13,13 @@ from typing import Any, Callable
 import paho.mqtt.client as mqtt
 
 from app.config import AppConfig
-from app.database import SavedMessage, save_message
+from app.database import (
+    SavedMessage,
+    get_message_by_hash,
+    get_message_by_id,
+    record_ack_replay_attempt,
+    save_message,
+)
 from app.message_parser import PLCMessageParseError, ParsedPLCMessage, parse_plc_message
 
 LOGGER = logging.getLogger(__name__)
@@ -239,11 +246,7 @@ class BEBMqttClient:
             database_path=self._config.database_path,
         )
         if not saved_message.inserted:
-            LOGGER.info(
-                "Duplicate message ignored: topic=%s hash=%s",
-                message.topic,
-                saved_message.message_hash,
-            )
+            self._handle_duplicate_message(saved_message)
             return
 
         LOGGER.info(
@@ -255,6 +258,86 @@ class BEBMqttClient:
     @staticmethod
     def _default_message_handler(message: ParsedPLCMessage) -> None:
         LOGGER.debug("No downstream handler configured for parsed PLC message: %s", message)
+
+    def _handle_duplicate_message(self, saved_message: SavedMessage) -> None:
+        record = get_message_by_id(saved_message.id, self._config.database_path)
+        if record is None:
+            record = get_message_by_hash(
+                saved_message.message_hash,
+                self._config.database_path,
+            )
+        if record is None:
+            LOGGER.warning(
+                "Duplicate ACK replay suppressed: original message not found hash=%s",
+                saved_message.message_hash,
+            )
+            return
+
+        if record.status != "COMPLETED":
+            LOGGER.info(
+                "Duplicate ACK replay suppressed: message id=%s hash=%s status=%s",
+                record.id,
+                record.message_hash,
+                record.status,
+            )
+            return
+
+        response = parse_stored_odoo_response(record.odoo_response)
+        if response is None:
+            LOGGER.warning(
+                "Duplicate ACK replay invalid response: message id=%s hash=%s",
+                record.id,
+                record.message_hash,
+            )
+            return
+
+        if response.get("success") is not True:
+            LOGGER.warning(
+                "Duplicate ACK replay invalid response: message id=%s hash=%s success=%r",
+                record.id,
+                record.message_hash,
+                response.get("success"),
+            )
+            return
+
+        ack = extract_stored_ack(response)
+        if ack is None:
+            LOGGER.warning(
+                "Duplicate ACK replay invalid response: message id=%s hash=%s missing ACK",
+                record.id,
+                record.message_hash,
+            )
+            return
+
+        attempt = record_ack_replay_attempt(
+            record.message_hash,
+            self._config.database_path,
+        )
+        if not attempt.allowed:
+            if attempt.reason == "minimum-interval":
+                LOGGER.info(
+                    "Duplicate ACK replay suppressed by minimum interval: id=%s hash=%s count=%s",
+                    record.id,
+                    record.message_hash,
+                    attempt.replay_count,
+                )
+                return
+            LOGGER.warning(
+                "Duplicate ACK replay limit reached: id=%s hash=%s count=%s",
+                record.id,
+                record.message_hash,
+                attempt.replay_count,
+            )
+            return
+
+        LOGGER.info(
+            "Replaying stored ACK for duplicate message: id=%s hash=%s ack=%s count=%s",
+            record.id,
+            record.message_hash,
+            ack,
+            attempt.replay_count,
+        )
+        self.publish_ack(ack)
 
 
 def format_received_message_log(
@@ -350,3 +433,28 @@ def _decode_payload_for_log(payload: bytes) -> str:
         return payload.decode("utf-8")
     except UnicodeDecodeError:
         return repr(payload)
+
+
+def parse_stored_odoo_response(response_text: str | None) -> dict[str, Any] | None:
+    """Parse valid JSON or legacy Python repr Odoo responses from SQLite."""
+    if not response_text:
+        return None
+
+    try:
+        parsed = json.loads(response_text)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(response_text)
+        except (SyntaxError, ValueError):
+            return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def extract_stored_ack(response: Mapping[str, Any]) -> str | None:
+    result = response.get("result")
+    if not isinstance(result, Mapping):
+        return None
+
+    ack = result.get("ACK")
+    return ack if isinstance(ack, str) and ack else None

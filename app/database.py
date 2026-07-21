@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -41,7 +41,18 @@ MIGRATION_COLUMNS = {
     "odoo_response": "TEXT",
     "last_attempt_at": "TEXT",
     "completed_at": "TEXT",
+    "ack": "TEXT",
+    "customer_id": "INTEGER",
+    "customer_name": "TEXT",
+    "operator_id": "INTEGER",
+    "operator_name": "TEXT",
+    "batch_number": "TEXT",
+    "ack_replay_count": "INTEGER DEFAULT 0",
+    "last_ack_replayed_at": "TEXT",
 }
+ACK_REPLAY_MAX_COUNT = 3
+ACK_REPLAY_MIN_INTERVAL = timedelta(seconds=2)
+ACK_REPLAY_WINDOW = timedelta(seconds=30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +81,25 @@ class MessageRecord:
     odoo_response: str | None = None
     last_attempt_at: str | None = None
     completed_at: str | None = None
+    ack: str | None = None
+    customer_id: int | None = None
+    customer_name: str | None = None
+    operator_id: int | None = None
+    operator_name: str | None = None
+    batch_number: str | None = None
+    ack_replay_count: int = 0
+    last_ack_replayed_at: str | None = None
 
 
 MqttMessageRecord = MessageRecord
+
+
+@dataclass(frozen=True, slots=True)
+class AckReplayAttempt:
+    allowed: bool
+    reason: str
+    replay_count: int
+    last_ack_replayed_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +555,13 @@ def mark_completed(
     odoo_response: str,
     completed_at: str,
     database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    ack: str | None = None,
+    customer_id: int | None = None,
+    customer_name: str | None = None,
+    operator_id: int | None = None,
+    operator_name: str | None = None,
+    batch_number: str | None = None,
 ) -> None:
     """Mark a queue row COMPLETED and store the returned Odoo response."""
     initialize_database(database_path)
@@ -540,10 +574,28 @@ def mark_completed(
                 processed_at = ?,
                 completed_at = ?,
                 last_error = NULL,
-                odoo_response = ?
+                odoo_response = ?,
+                ack = ?,
+                customer_id = ?,
+                customer_name = ?,
+                operator_id = ?,
+                operator_name = ?,
+                batch_number = ?
             WHERE id = ?
             """,
-            ("COMPLETED", completed_at, completed_at, odoo_response, message_id),
+            (
+                "COMPLETED",
+                completed_at,
+                completed_at,
+                odoo_response,
+                ack,
+                customer_id,
+                customer_name,
+                operator_id,
+                operator_name,
+                batch_number,
+                message_id,
+            ),
         )
         if cursor.rowcount != 1:
             raise ValueError(f"Message id not found: {message_id}")
@@ -555,22 +607,40 @@ def mark_failed(
     last_attempt_at: str,
     database_path: str | Path = DEFAULT_DATABASE_PATH,
     odoo_response: str | None = None,
+    *,
+    retryable: bool = True,
+    max_retries: int | None = None,
 ) -> None:
     """Mark a queue row FAILED, incrementing retry_count and storing failure detail."""
     initialize_database(database_path)
+    retry_count_sql = "retry_count + 1"
+    parameters: tuple[object, ...]
+    if not retryable:
+        final_retry_count = max_retries if max_retries is not None else 10
+        retry_count_sql = f"MAX(retry_count + 1, ?)"
+        parameters = (
+            "FAILED",
+            final_retry_count,
+            error,
+            last_attempt_at,
+            odoo_response,
+            message_id,
+        )
+    else:
+        parameters = ("FAILED", error, last_attempt_at, odoo_response, message_id)
 
     with _open_connection(database_path) as connection:
         cursor = connection.execute(
-            """
+            f"""
             UPDATE mqtt_messages
             SET status = ?,
-                retry_count = retry_count + 1,
+                retry_count = {retry_count_sql},
                 last_error = ?,
                 last_attempt_at = ?,
                 odoo_response = COALESCE(?, odoo_response)
             WHERE id = ?
             """,
-            ("FAILED", error, last_attempt_at, odoo_response, message_id),
+            parameters,
         )
         if cursor.rowcount != 1:
             raise ValueError(f"Message id not found: {message_id}")
@@ -597,7 +667,7 @@ def reset_stale_processing(
             """,
             (
                 "FAILED",
-                "Recovered stale PROCESSING message after application restart",
+                "Recovered stale PROCESSING message after timeout",
                 recovered_at,
                 "PROCESSING",
                 stale_before,
@@ -624,6 +694,103 @@ def get_message_by_id(
         ).fetchone()
 
     return _record_from_row(row) if row is not None else None
+
+
+def get_message_by_hash(
+    message_hash: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+) -> MessageRecord | None:
+    """Return one queue record by message hash."""
+    initialize_database(database_path)
+
+    with _open_connection(database_path) as connection:
+        row = connection.execute(
+            f"""
+            SELECT {_record_columns_sql()}
+            FROM mqtt_messages
+            WHERE message_hash = ?
+            LIMIT 1
+            """,
+            (message_hash,),
+        ).fetchone()
+
+    return _record_from_row(row) if row is not None else None
+
+
+def record_ack_replay_attempt(
+    message_hash: str,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    replayed_at: datetime | None = None,
+) -> AckReplayAttempt:
+    """Atomically apply replay throttling for a completed duplicate ACK."""
+    initialize_database(database_path)
+    now = replayed_at or datetime.now(timezone.utc)
+    now_text = _format_timestamp(now)
+
+    connection = _connect(database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT ack_replay_count, last_ack_replayed_at
+            FROM mqtt_messages
+            WHERE message_hash = ?
+            LIMIT 1
+            """,
+            (message_hash,),
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            raise ValueError(f"Message hash not found: {message_hash}")
+
+        replay_count = int(row["ack_replay_count"] or 0)
+        last_replayed_at = _parse_timestamp(row["last_ack_replayed_at"])
+        if last_replayed_at is None:
+            replay_count = 0
+        elif now - last_replayed_at >= ACK_REPLAY_WINDOW:
+            replay_count = 0
+            last_replayed_at = None
+
+        if replay_count >= ACK_REPLAY_MAX_COUNT:
+            connection.commit()
+            return AckReplayAttempt(
+                allowed=False,
+                reason="replay-limit-reached",
+                replay_count=replay_count,
+                last_ack_replayed_at=row["last_ack_replayed_at"],
+            )
+
+        if last_replayed_at is not None and now - last_replayed_at < ACK_REPLAY_MIN_INTERVAL:
+            connection.commit()
+            return AckReplayAttempt(
+                allowed=False,
+                reason="minimum-interval",
+                replay_count=replay_count,
+                last_ack_replayed_at=row["last_ack_replayed_at"],
+            )
+
+        new_replay_count = replay_count + 1
+        connection.execute(
+            """
+            UPDATE mqtt_messages
+            SET ack_replay_count = ?,
+                last_ack_replayed_at = ?
+            WHERE message_hash = ?
+            """,
+            (new_replay_count, now_text, message_hash),
+        )
+        connection.commit()
+        return AckReplayAttempt(
+            allowed=True,
+            reason="replayed",
+            replay_count=new_replay_count,
+            last_ack_replayed_at=now_text,
+        )
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def get_queue_counts(
@@ -732,6 +899,14 @@ def _record_from_row(row: sqlite3.Row) -> MessageRecord:
         odoo_response=row["odoo_response"],
         last_attempt_at=row["last_attempt_at"],
         completed_at=row["completed_at"],
+        ack=row["ack"],
+        customer_id=row["customer_id"],
+        customer_name=row["customer_name"],
+        operator_id=row["operator_id"],
+        operator_name=row["operator_name"],
+        batch_number=row["batch_number"],
+        ack_replay_count=int(row["ack_replay_count"] or 0),
+        last_ack_replayed_at=row["last_ack_replayed_at"],
     )
 
 
@@ -805,7 +980,15 @@ def _record_columns_sql() -> str:
         last_error,
         odoo_response,
         last_attempt_at,
-        completed_at
+        completed_at,
+        ack,
+        customer_id,
+        customer_name,
+        operator_id,
+        operator_name,
+        batch_number,
+        ack_replay_count,
+        last_ack_replayed_at
     """
 
 
@@ -813,3 +996,12 @@ def _format_timestamp(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
