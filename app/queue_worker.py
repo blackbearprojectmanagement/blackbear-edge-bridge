@@ -332,14 +332,9 @@ class OdooQueueWorker:
         submission = self._submit_with_hard_timeout(record, payload)
         if submission.timed_out:
             # The child is killed locally, but Odoo may still finish the request
-            # server-side. Any retry after this point depends on Odoo idempotency
-            # or the original PLC message identity to avoid duplicate effects.
-            error = (
-                "Odoo submission timed out after "
-                f"{self._submission_timeout} seconds. The server-side call may "
-                "still have completed; retry relies on Odoo idempotency or PLC "
-                "message identity."
-            )
+            # server-side. MN/MP submissions can produce labels, so a timeout is
+            # terminal and requires manual verification rather than automatic retry.
+            error = "Odoo timeout; server-side completion unknown; manual verification required"
             LOGGER.error(
                 "\n%s",
                 format_xmlrpc_submission_timeout_log(
@@ -351,7 +346,12 @@ class OdooQueueWorker:
                     submission.exitcode,
                 ),
             )
-            failed_record = self._mark_record_failed(record, error, last_attempt_at)
+            failed_record = self._mark_record_failed(
+                record,
+                error,
+                last_attempt_at,
+                retryable=False,
+            )
             LOGGER.error("\n%s", format_failure_log(failed_record, error))
             self._state.finish_record(succeeded=False)
             return
@@ -498,8 +498,8 @@ class OdooQueueWorker:
         if process.is_alive():
             LOGGER.warning(
                 "Odoo submission timeout for record id=%s serial=%s after %.3fs "
-                "(threshold=%ss). Terminating child. A retry may duplicate a "
-                "server-side completion unless Odoo/message identity is idempotent.",
+                "(threshold=%ss). Terminating child; manual verification required. "
+                "Automatic retry is suppressed because server-side completion is unknown.",
                 record.id,
                 record.serial,
                 time.monotonic() - start_time,
@@ -805,6 +805,7 @@ def format_xmlrpc_submission_timeout_log(
             f"Child Terminated  : {terminated}",
             f"Child Killed      : {killed}",
             f"Child Exit Code   : {exitcode}",
+            "Manual Verification : required",
             "-" * 50,
         ]
     )

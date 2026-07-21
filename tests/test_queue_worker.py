@@ -395,19 +395,29 @@ class TestOdooQueueWorker(unittest.TestCase):
     def test_hung_odoo_call_times_out_and_child_terminates(self) -> None:
         saved = self._save_raw('{"MN":"106-020C012P001 9001T01"}', serial="9001")
         fake_client = ConditionalOdooClient(hang_serials={"9001"}, sleep_seconds=30)
-        worker = self._worker(fake_client, submission_timeout=1)
+        published_acks: list[str] = []
+        worker = self._worker(
+            fake_client,
+            ack_publisher=published_acks.append,
+            max_retries=10,
+            submission_timeout=1,
+        )
 
         with self.assertLogs("app.queue_worker", level="WARNING") as logs:
             worker.run_once()
 
         record = get_message_by_id(saved.id, self.database_path)
         self.assertEqual(record.status, "FAILED")
-        self.assertEqual(record.retry_count, 1)
-        self.assertIn("timed out", record.last_error)
+        self.assertEqual(record.retry_count, 10)
+        self.assertEqual(
+            record.last_error,
+            "Odoo timeout; server-side completion unknown; manual verification required",
+        )
+        self.assertEqual(published_acks, [])
         self.assertIsNone(worker._active_submission_process)
         log_text = "\n".join(logs.output)
         self.assertIn("Odoo submission timeout", log_text)
-        self.assertIn("retry may duplicate", log_text)
+        self.assertIn("manual verification required", log_text)
 
     def test_worker_continues_to_next_record_after_timeout(self) -> None:
         timed_out = self._save_raw('{"MN":"106-020C012P001 9002T01"}', serial="9002")
@@ -416,7 +426,13 @@ class TestOdooQueueWorker(unittest.TestCase):
             serial="9003",
         )
         fake_client = ConditionalOdooClient(hang_serials={"9002"}, sleep_seconds=30)
-        worker = self._worker(fake_client, submission_timeout=1)
+        published_acks: list[str] = []
+        worker = self._worker(
+            fake_client,
+            ack_publisher=published_acks.append,
+            max_retries=10,
+            submission_timeout=1,
+        )
 
         processed = worker.run_once()
 
@@ -424,9 +440,35 @@ class TestOdooQueueWorker(unittest.TestCase):
         succeeded_record = get_message_by_id(succeeded.id, self.database_path)
         self.assertEqual(processed, 2)
         self.assertEqual(timed_out_record.status, "FAILED")
-        self.assertEqual(timed_out_record.retry_count, 1)
+        self.assertEqual(timed_out_record.retry_count, 10)
         self.assertEqual(succeeded_record.status, "COMPLETED")
         self.assertEqual(succeeded_record.ack, "9003")
+        self.assertEqual(published_acks, ["9003"])
+
+    def test_timeout_does_not_retry_or_duplicate_submission(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 9007T01"}', serial="9007")
+        fake_client = ConditionalOdooClient(hang_serials={"9007"}, sleep_seconds=30)
+        published_acks: list[str] = []
+        worker = self._worker(
+            fake_client,
+            ack_publisher=published_acks.append,
+            max_retries=3,
+            submission_timeout=1,
+        )
+
+        first_count = worker.run_once()
+        second_count = worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.retry_count, 3)
+        self.assertEqual(
+            fake_client.submitted_payloads,
+            [{"MN": "106-020C012P001 9007T01"}],
+        )
+        self.assertEqual(published_acks, [])
 
     def test_service_stop_terminates_active_child_and_returns_promptly(self) -> None:
         saved = self._save_raw('{"MN":"106-020C012P001 9004T01"}', serial="9004")
