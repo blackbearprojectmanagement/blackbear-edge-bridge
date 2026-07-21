@@ -20,6 +20,8 @@ from app.config import AppConfig
 from app.database import (
     get_api_command_by_idempotency_key,
     initialize_api_commands_table,
+    save_message,
+    update_status,
 )
 from app.mqtt_client import BEBMqttClient, PLC_JSON_SEPARATORS, PublishResult
 
@@ -59,6 +61,24 @@ class FakeMqttClient:
             topic="MQTT/ODOO_TO_PLC/topic",
             payload=plc_payload,
         )
+
+
+class FakeWorker:
+    def __init__(self, healthy: bool) -> None:
+        self.healthy = healthy
+
+    def health_snapshot(self, heartbeat_threshold_seconds: int) -> dict[str, object]:
+        return {
+            "worker_running": True,
+            "worker_healthy": self.healthy,
+            "worker_last_heartbeat": "2026-07-21T10:00:00+00:00",
+            "worker_current_message_id": None,
+            "worker_current_processing_seconds": None,
+            "queue_new_count": 1,
+            "queue_processing_count": 0,
+            "queue_failed_count": 0,
+            "queue_completed_count": 1,
+        }
 
 
 def make_config(database_path: Path, **overrides: object) -> AppConfig:
@@ -115,11 +135,22 @@ class ApiTestCase(unittest.TestCase):
     def make_client(
         self,
         mqtt_client: FakeMqttClient | None = None,
+        odoo_worker: object | None = None,
         **config_overrides: object,
     ) -> tuple[TestClient, FakeMqttClient]:
         config = make_config(self.database_path, **config_overrides)
         fake_mqtt = mqtt_client or FakeMqttClient()
-        return TestClient(create_api_app(config, fake_mqtt, self.database_path)), fake_mqtt
+        return (
+            TestClient(
+                create_api_app(
+                    config,
+                    fake_mqtt,
+                    self.database_path,
+                    odoo_worker,
+                )
+            ),
+            fake_mqtt,
+        )
 
     def post_command(
         self,
@@ -152,6 +183,66 @@ class TestBebApi(ApiTestCase):
         self.assertTrue(response.json()["mqtt_connected"])
         self.assertTrue(response.json()["odoo_enabled"])
         self.assertTrue(response.json()["api_enabled"])
+        self.assertIn("worker_running", response.json())
+        self.assertIn("worker_healthy", response.json())
+        self.assertIn("queue_new_count", response.json())
+        self.assertIn("queue_processing_count", response.json())
+        self.assertIn("queue_failed_count", response.json())
+        self.assertIn("queue_completed_count", response.json())
+
+    def test_health_degrades_when_worker_unhealthy(self) -> None:
+        client, _ = self.make_client(odoo_worker=FakeWorker(healthy=False))
+
+        response = client.get("/health")
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertTrue(body["worker_running"])
+        self.assertFalse(body["worker_healthy"])
+        self.assertEqual(body["worker_last_heartbeat"], "2026-07-21T10:00:00+00:00")
+
+    def test_health_returns_ok_when_worker_recovers(self) -> None:
+        client, _ = self.make_client(odoo_worker=FakeWorker(healthy=True))
+
+        response = client.get("/health")
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["worker_healthy"])
+        self.assertEqual(body["queue_new_count"], 1)
+        self.assertEqual(body["queue_completed_count"], 1)
+
+    def test_health_reports_database_queue_counts_without_worker(self) -> None:
+        saved_new = save_message(
+            topic="MQTT/PLC_TO_ODOO/topic",
+            raw_payload='{"MN":"106-020C012P0013001T01"}',
+            message_type="MN",
+            table_no="T01",
+            model="106-020C012P001",
+            serial="3001",
+            database_path=self.database_path,
+        )
+        saved_completed = save_message(
+            topic="MQTT/PLC_TO_ODOO/topic",
+            raw_payload='{"MN":"106-020C012P0013002T01"}',
+            message_type="MN",
+            table_no="T01",
+            model="106-020C012P001",
+            serial="3002",
+            database_path=self.database_path,
+        )
+        update_status(saved_completed.id, "COMPLETED", self.database_path)
+        client, _ = self.make_client(odoo_enabled=False)
+
+        body = client.get("/health").json()
+
+        self.assertEqual(body["status"], "ok")
+        self.assertFalse(body["worker_running"])
+        self.assertTrue(body["worker_healthy"])
+        self.assertEqual(body["queue_new_count"], 1)
+        self.assertEqual(body["queue_completed_count"], 1)
 
     def test_missing_authentication_returns_401(self) -> None:
         client, _ = self.make_client()

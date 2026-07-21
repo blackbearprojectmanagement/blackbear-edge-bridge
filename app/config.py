@@ -31,6 +31,7 @@ class AppConfig:
     odoo_batch_size: int
     odoo_max_retries: int
     odoo_stale_processing_seconds: int
+    odoo_worker_heartbeat_seconds: int = 60
     beb_api_enabled: bool = False
     beb_api_host: str = "127.0.0.1"
     beb_api_port: int = 8000
@@ -101,6 +102,9 @@ def load_config() -> AppConfig:
         odoo_max_retries=_get_int("ODOO_MAX_RETRIES", 10),
         odoo_stale_processing_seconds=_get_int(
             "ODOO_STALE_PROCESSING_SECONDS", 300
+        ),
+        odoo_worker_heartbeat_seconds=_get_int(
+            "ODOO_WORKER_HEARTBEAT_SECONDS", 60
         ),
         beb_api_enabled=_get_bool("BEB_API_ENABLED", False),
         beb_api_host=os.getenv("BEB_API_HOST", "127.0.0.1"),

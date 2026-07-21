@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 import unittest
 import uuid
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +16,7 @@ from app.odoo_client import OdooAuthenticationError, OdooSubmissionError
 from app.queue_worker import OdooQueueWorker
 
 
-DEFAULT_RESPONSE = object()
+DEFAULT_RESPONSE = ("__default_response__",)
 
 
 class FakeOdooClient:
@@ -44,9 +46,32 @@ class FakeOdooClient:
         self.submitted_payloads.append(payload)
         if self.fail_on == len(self.submitted_payloads):
             raise OdooSubmissionError("submission failed")
-        if self.response is not DEFAULT_RESPONSE:
+        if self.response != DEFAULT_RESPONSE:
             return self.response
         return {"success": True, "result": {"ACK": "3242", "accepted": payload}}
+
+
+class ConditionalOdooClient(FakeOdooClient):
+    def __init__(self, *, hang_serials: set[str], sleep_seconds: float = 30.0) -> None:
+        super().__init__()
+        self.hang_serials = hang_serials
+        self.sleep_seconds = sleep_seconds
+
+    def submit_print_data(self, payload: dict[str, str]) -> object:
+        value = next(iter(payload.values()))
+        if any(serial in value for serial in self.hang_serials):
+            time.sleep(self.sleep_seconds)
+        without_table = value[:-3]
+        if " " in without_table:
+            ack = without_table.rsplit(" ", maxsplit=1)[-1]
+        else:
+            digits: list[str] = []
+            for char in reversed(without_table):
+                if not char.isdigit():
+                    break
+                digits.append(char)
+            ack = "".join(reversed(digits))
+        return {"success": True, "result": {"ACK": ack}}
 
 
 class TestOdooQueueWorker(unittest.TestCase):
@@ -145,7 +170,7 @@ class TestOdooQueueWorker(unittest.TestCase):
         worker = self._worker(fake_client)
 
         with (
-            patch("app.queue_worker.time.monotonic", side_effect=[10.0, 10.125]),
+            patch("app.queue_worker.time.monotonic", side_effect=[10.0, 10.0, 10.1, 10.125]),
             self.assertLogs("app.queue_worker", level="INFO") as logs,
         ):
             worker.run_once()
@@ -171,7 +196,7 @@ class TestOdooQueueWorker(unittest.TestCase):
         worker = self._worker(fake_client)
 
         with (
-            patch("app.queue_worker.time.monotonic", side_effect=[20.0, 20.5]),
+            patch("app.queue_worker.time.monotonic", side_effect=[20.0, 20.0, 20.5]),
             self.assertLogs("app.queue_worker", level="INFO") as logs,
         ):
             worker.run_once()
@@ -351,6 +376,153 @@ class TestOdooQueueWorker(unittest.TestCase):
         self.assertEqual(record.retry_count, 10)
         self.assertEqual(fake_client.submitted_payloads, [{"MN": "106-020C012P001 3242T01"}])
 
+    def test_hung_odoo_call_times_out_and_child_terminates(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 9001T01"}', serial="9001")
+        fake_client = ConditionalOdooClient(hang_serials={"9001"}, sleep_seconds=30)
+        worker = self._worker(fake_client, submission_timeout=1)
+
+        with self.assertLogs("app.queue_worker", level="WARNING") as logs:
+            worker.run_once()
+
+        record = get_message_by_id(saved.id, self.database_path)
+        self.assertEqual(record.status, "FAILED")
+        self.assertEqual(record.retry_count, 1)
+        self.assertIn("timed out", record.last_error)
+        self.assertIsNone(worker._active_submission_process)
+        log_text = "\n".join(logs.output)
+        self.assertIn("Odoo submission timeout", log_text)
+        self.assertIn("retry may duplicate", log_text)
+
+    def test_worker_continues_to_next_record_after_timeout(self) -> None:
+        timed_out = self._save_raw('{"MN":"106-020C012P001 9002T01"}', serial="9002")
+        succeeded = self._save_raw(
+            '{"MN":"106-020C012P001 9003T01"}',
+            serial="9003",
+        )
+        fake_client = ConditionalOdooClient(hang_serials={"9002"}, sleep_seconds=30)
+        worker = self._worker(fake_client, submission_timeout=1)
+
+        processed = worker.run_once()
+
+        timed_out_record = get_message_by_id(timed_out.id, self.database_path)
+        succeeded_record = get_message_by_id(succeeded.id, self.database_path)
+        self.assertEqual(processed, 2)
+        self.assertEqual(timed_out_record.status, "FAILED")
+        self.assertEqual(timed_out_record.retry_count, 1)
+        self.assertEqual(succeeded_record.status, "COMPLETED")
+        self.assertEqual(succeeded_record.ack, "9003")
+
+    def test_service_stop_terminates_active_child_and_returns_promptly(self) -> None:
+        saved = self._save_raw('{"MN":"106-020C012P001 9004T01"}', serial="9004")
+        fake_client = ConditionalOdooClient(hang_serials={"9004"}, sleep_seconds=30)
+        worker = self._worker(
+            fake_client,
+            submission_timeout=10,
+            watchdog_interval=1,
+        )
+
+        worker.start()
+        deadline = time.monotonic() + 5
+        while worker.state_snapshot().current_record_id != saved.id:
+            if time.monotonic() > deadline:
+                self.fail("worker did not start processing the hung record")
+            time.sleep(0.05)
+
+        stop_started = time.monotonic()
+        worker.stop()
+        stop_elapsed = time.monotonic() - stop_started
+
+        self.assertLess(stop_elapsed, 5)
+        self.assertFalse(worker.is_running())
+
+    def test_health_is_unhealthy_when_heartbeat_is_stale(self) -> None:
+        fake_client = FakeOdooClient()
+        worker = self._worker(fake_client, submission_timeout=10)
+        worker._state.heartbeat(
+            datetime.now(timezone.utc) - timedelta(seconds=120)
+        )
+
+        with patch.object(worker, "is_running", return_value=True):
+            health = worker.health_snapshot(heartbeat_threshold_seconds=1)
+
+        self.assertTrue(health["worker_running"])
+        self.assertFalse(health["worker_healthy"])
+
+    def test_health_is_unhealthy_when_current_record_exceeds_timeout(self) -> None:
+        fake_client = FakeOdooClient()
+        worker = self._worker(fake_client, submission_timeout=1)
+        worker._state.begin_record(
+            42,
+            datetime.now(timezone.utc) - timedelta(seconds=5),
+        )
+
+        with patch.object(worker, "is_running", return_value=True):
+            health = worker.health_snapshot(heartbeat_threshold_seconds=30)
+
+        self.assertFalse(health["worker_healthy"])
+        self.assertEqual(health["worker_current_message_id"], 42)
+        self.assertGreaterEqual(health["worker_current_processing_seconds"], 5)
+
+    def test_health_recovers_after_successful_processing(self) -> None:
+        self._save_raw('{"MN":"106-020C012P001 9010T01"}', serial="9010")
+        fake_client = FakeOdooClient(
+            response={"success": True, "result": {"ACK": "9010"}}
+        )
+        worker = self._worker(fake_client)
+
+        worker.run_once()
+
+        with patch.object(worker, "is_running", return_value=True):
+            health = worker.health_snapshot(heartbeat_threshold_seconds=30)
+
+        self.assertTrue(health["worker_healthy"])
+        self.assertIsNone(health["worker_current_message_id"])
+        self.assertEqual(health["queue_completed_count"], 1)
+
+    def test_watchdog_remains_active_while_worker_submission_is_blocked(self) -> None:
+        stale = self._save_raw('{"MN":"106-020C012P001 9005T01"}', serial="9005")
+        self._save_raw('{"MN":"106-020C012P001 9006T01"}', serial="9006")
+        claim_pending_messages(1, 10, self.database_path)
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE mqtt_messages
+                    SET last_attempt_at = ?
+                    WHERE id = ?
+                    """,
+                    ("2026-07-21T09:00:00+00:00", stale.id),
+                )
+
+        fake_client = FakeOdooClient()
+        worker = self._worker(
+            fake_client,
+            max_retries=1,
+            stale_processing_timeout=1,
+            watchdog_interval=1,
+        )
+        blocked = threading.Event()
+        original_submit = worker._submit_with_hard_timeout
+
+        def blocked_submission(record, payload):
+            blocked.set()
+            time.sleep(3)
+            return original_submit(record, payload)
+
+        with patch.object(worker, "_submit_with_hard_timeout", side_effect=blocked_submission):
+            worker.start()
+            self.assertTrue(blocked.wait(timeout=5))
+            deadline = time.monotonic() + 5
+            while get_message_by_id(stale.id, self.database_path).status != "FAILED":
+                if time.monotonic() > deadline:
+                    self.fail("watchdog did not recover stale PROCESSING row")
+                time.sleep(0.05)
+            worker.stop()
+
+        recovered = get_message_by_id(stale.id, self.database_path)
+        self.assertEqual(recovered.status, "FAILED")
+        self.assertGreaterEqual(recovered.retry_count, 1)
+
     def test_stale_processing_recovery_runs_during_worker_runtime(self) -> None:
         saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
         claim_pending_messages(10, 10, self.database_path)
@@ -370,7 +542,7 @@ class TestOdooQueueWorker(unittest.TestCase):
         with patch("app.queue_worker.datetime") as fake_datetime:
             fake_datetime.now.return_value = datetime(2026, 7, 21, 10, 0, 0, tzinfo=timezone.utc)
             fake_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
-            worker.run_once()
+            worker.recover_stale_processing()
 
         record = get_message_by_id(saved.id, self.database_path)
         self.assertEqual(record.status, "FAILED")
@@ -393,6 +565,9 @@ class TestOdooQueueWorker(unittest.TestCase):
         fake_client: FakeOdooClient,
         ack_publisher=None,
         max_retries: int = 10,
+        submission_timeout: int = 15,
+        stale_processing_timeout: int = 300,
+        watchdog_interval: int = 30,
     ) -> OdooQueueWorker:
         return OdooQueueWorker(
             database_path=self.database_path,
@@ -400,8 +575,10 @@ class TestOdooQueueWorker(unittest.TestCase):
             worker_interval=1,
             batch_size=10,
             max_retries=max_retries,
-            stale_processing_timeout=300,
+            stale_processing_timeout=stale_processing_timeout,
             ack_publisher=ack_publisher,
+            submission_timeout=submission_timeout,
+            watchdog_interval=watchdog_interval,
         )
 
     def _assert_invalid_response_marks_failed(self, response: object) -> None:

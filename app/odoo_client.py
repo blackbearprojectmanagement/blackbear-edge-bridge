@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import socket
 import ssl
+from dataclasses import dataclass
+from typing import Any
 import xmlrpc.client
 
 
@@ -17,6 +19,17 @@ class OdooAuthenticationError(Exception):
 
 class OdooSubmissionError(Exception):
     """Raised when submitting print data to Odoo fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class OdooClientSettings:
+    url: str
+    database: str
+    username: str
+    password: str
+    model: str
+    submit_method: str
+    timeout: int
 
 
 class OdooXmlRpcClient:
@@ -38,9 +51,38 @@ class OdooXmlRpcClient:
         self._password = password
         self._model = model
         self._submit_method = submit_method
+        self._timeout = timeout
         self._uid: int | None = None
         self._common: xmlrpc.client.ServerProxy | None = None
         self._models: xmlrpc.client.ServerProxy | None = None
+
+    @property
+    def timeout(self) -> int:
+        return self._timeout
+
+    def settings(self) -> OdooClientSettings:
+        """Return serializable settings for isolated subprocess submissions."""
+        return OdooClientSettings(
+            url=self._url,
+            database=self._database,
+            username=self._username,
+            password=self._password,
+            model=self._model,
+            submit_method=self._submit_method,
+            timeout=self._timeout,
+        )
+
+    @classmethod
+    def from_settings(cls, settings: OdooClientSettings) -> OdooXmlRpcClient:
+        return cls(
+            url=settings.url,
+            database=settings.database,
+            username=settings.username,
+            password=settings.password,
+            model=settings.model,
+            submit_method=settings.submit_method,
+            timeout=settings.timeout,
+        )
 
     def authenticate(self) -> int:
         """Authenticate with Odoo and return the numeric UID."""
@@ -53,11 +95,11 @@ class OdooXmlRpcClient:
                 {},
             )
         except _ODOO_TRANSPORT_ERRORS as exc:
-            self.invalidate_session()
+            self.close()
             raise OdooAuthenticationError(f"Odoo authentication failed: {exc}") from exc
 
         if not isinstance(uid, int) or uid <= 0:
-            self.invalidate_session()
+            self.close()
             raise OdooAuthenticationError("Odoo authentication failed: invalid UID")
 
         self._uid = uid
@@ -78,6 +120,10 @@ class OdooXmlRpcClient:
 
     def invalidate_session(self) -> None:
         self._uid = None
+
+    def reset_session(self) -> None:
+        """Drop cached proxies and authentication state after unsafe transport errors."""
+        self.close()
 
     def close(self) -> None:
         self._common = None
@@ -110,16 +156,20 @@ class OdooXmlRpcClient:
                 return self._submit_print_data(payload, allow_reauth=False)
             raise OdooSubmissionError(f"Odoo XML-RPC fault: {exc}") from exc
         except xmlrpc.client.ProtocolError as exc:
+            self.close()
             raise OdooSubmissionError(
                 f"Odoo XML-RPC protocol error: {exc.errcode} {exc.errmsg}"
             ) from exc
         except _ODOO_TRANSPORT_ERRORS as exc:
+            self.close()
             raise OdooSubmissionError(f"Odoo XML-RPC transport error: {exc}") from exc
 
     def _get_common_proxy(self) -> xmlrpc.client.ServerProxy:
         if self._common is None:
             self._common = xmlrpc.client.ServerProxy(
                 f"{self._url}/xmlrpc/2/common",
+                transport=_make_timeout_transport(self._url, self._timeout),
+                allow_none=True,
             )
         return self._common
 
@@ -127,6 +177,8 @@ class OdooXmlRpcClient:
         if self._models is None:
             self._models = xmlrpc.client.ServerProxy(
                 f"{self._url}/xmlrpc/2/object",
+                transport=_make_timeout_transport(self._url, self._timeout),
+                allow_none=True,
             )
         return self._models
 
@@ -154,3 +206,34 @@ def _is_authentication_fault(exc: xmlrpc.client.Fault) -> bool:
             "uid",
         )
     )
+
+
+class _TimeoutTransport(xmlrpc.client.Transport):
+    def __init__(self, timeout: int) -> None:
+        super().__init__()
+        self._timeout = timeout
+
+    def make_connection(self, host: str) -> Any:
+        connection = super().make_connection(host)
+        connection.timeout = self._timeout
+        return connection
+
+
+class _TimeoutSafeTransport(xmlrpc.client.SafeTransport):
+    def __init__(self, timeout: int) -> None:
+        super().__init__()
+        self._timeout = timeout
+
+    def make_connection(self, host: str) -> Any:
+        connection = super().make_connection(host)
+        connection.timeout = self._timeout
+        return connection
+
+
+def _make_timeout_transport(
+    url: str,
+    timeout: int,
+) -> xmlrpc.client.Transport | xmlrpc.client.SafeTransport:
+    if url.lower().startswith("https://"):
+        return _TimeoutSafeTransport(timeout)
+    return _TimeoutTransport(timeout)

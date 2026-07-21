@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 
 from app.odoo_client import (
     OdooAuthenticationError,
+    OdooClientSettings,
     OdooSubmissionError,
     OdooXmlRpcClient,
+    _TimeoutSafeTransport,
 )
 
 
@@ -38,7 +40,11 @@ class TestOdooXmlRpcClient(unittest.TestCase):
             server_proxy.call_args.args[0],
             "https://test-bbw.odoo.com/xmlrpc/2/common",
         )
-        self.assertEqual(server_proxy.call_args.kwargs, {})
+        self.assertTrue(server_proxy.call_args.kwargs["allow_none"])
+        self.assertIsInstance(
+            server_proxy.call_args.kwargs["transport"],
+            _TimeoutSafeTransport,
+        )
         common.authenticate.assert_called_once_with(
             "broadtechit-test-bbw-stage-34933250",
             "admin",
@@ -70,8 +76,16 @@ class TestOdooXmlRpcClient(unittest.TestCase):
             server_proxy.call_args_list[1].args[0],
             "https://test-bbw.odoo.com/xmlrpc/2/object",
         )
-        self.assertEqual(server_proxy.call_args_list[0].kwargs, {})
-        self.assertEqual(server_proxy.call_args_list[1].kwargs, {})
+        self.assertIsInstance(
+            server_proxy.call_args_list[0].kwargs["transport"],
+            _TimeoutSafeTransport,
+        )
+        self.assertIsInstance(
+            server_proxy.call_args_list[1].kwargs["transport"],
+            _TimeoutSafeTransport,
+        )
+        self.assertTrue(server_proxy.call_args_list[0].kwargs["allow_none"])
+        self.assertTrue(server_proxy.call_args_list[1].kwargs["allow_none"])
         models.execute_kw.assert_called_once_with(
             "broadtechit-test-bbw-stage-34933250",
             7,
@@ -172,6 +186,42 @@ class TestOdooXmlRpcClient(unittest.TestCase):
 
         self.client.close()
         self.client.close()
+
+        self.assertIsNone(self.client._common)
+        self.assertIsNone(self.client._models)
+        self.assertIsNone(self.client._uid)
+
+    def test_settings_are_serializable_for_worker_child(self) -> None:
+        settings = self.client.settings()
+
+        self.assertEqual(
+            settings,
+            OdooClientSettings(
+                url="https://test-bbw.odoo.com",
+                database="broadtechit-test-bbw-stage-34933250",
+                username="admin",
+                password="secret",
+                model="iot.configuration",
+                submit_method="xmlrpc_submit_print_data",
+                timeout=15,
+            ),
+        )
+
+    @patch("app.odoo_client.xmlrpc.client.ServerProxy")
+    def test_protocol_error_resets_cached_proxies(self, server_proxy) -> None:
+        common = MagicMock()
+        common.authenticate.return_value = 7
+        models = MagicMock()
+        models.execute_kw.side_effect = xmlrpc.client.ProtocolError(
+            "https://test-bbw.odoo.com/xmlrpc/2/object",
+            500,
+            "Server Error",
+            {},
+        )
+        server_proxy.side_effect = [common, models]
+
+        with self.assertRaises(OdooSubmissionError):
+            self.client.submit_print_data({"MN": "106-020C012P001 3242T01"})
 
         self.assertIsNone(self.client._common)
         self.assertIsNone(self.client._models)

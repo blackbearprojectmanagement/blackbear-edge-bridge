@@ -198,8 +198,8 @@ Retry behavior:
 
 - `FAILED` rows are retried while `retry_count < ODOO_MAX_RETRIES`.
 - `mark_failed()` increments `retry_count`.
-- `PROCESSING` rows older than `ODOO_STALE_PROCESSING_SECONDS` are recovered as `FAILED` on worker startup.
-- Recovered stale rows store `Recovered stale PROCESSING message after application restart` in `last_error`.
+- `PROCESSING` rows older than `ODOO_STALE_PROCESSING_SECONDS` are recovered as `FAILED` by an independent watchdog.
+- Recovered stale rows store `Recovered stale PROCESSING message after timeout` in `last_error`.
 
 ## Odoo XML-RPC
 
@@ -283,6 +283,7 @@ ODOO_WORKER_INTERVAL=2
 ODOO_BATCH_SIZE=10
 ODOO_MAX_RETRIES=10
 ODOO_STALE_PROCESSING_SECONDS=300
+ODOO_WORKER_HEARTBEAT_SECONDS=60
 BEB_API_ENABLED=false
 BEB_API_HOST=127.0.0.1
 BEB_API_PORT=8000
@@ -333,6 +334,7 @@ ODOO_WORKER_INTERVAL=2
 ODOO_BATCH_SIZE=10
 ODOO_MAX_RETRIES=10
 ODOO_STALE_PROCESSING_SECONDS=300
+ODOO_WORKER_HEARTBEAT_SECONDS=60
 
 BEB_API_ENABLED=true
 BEB_API_HOST=127.0.0.1

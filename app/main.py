@@ -48,6 +48,7 @@ def create_odoo_worker(
         max_retries=config.odoo_max_retries,
         stale_processing_timeout=config.odoo_stale_processing_seconds,
         ack_publisher=ack_publisher,
+        submission_timeout=config.odoo_timeout,
     )
     return worker, odoo_client
 
@@ -66,7 +67,7 @@ def main() -> None:
         worker, odoo_client = worker_bundle
         worker.start()
 
-    api_server = BebApiServer(config, client, config.database_path)
+    api_server = BebApiServer(config, client, config.database_path, worker)
 
     try:
         client.start_loop()

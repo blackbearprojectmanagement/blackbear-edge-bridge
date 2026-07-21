@@ -21,6 +21,7 @@ from app.database import (
     ApiCommandRecord,
     create_api_command_record,
     get_api_command_by_idempotency_key,
+    get_queue_counts,
     initialize_api_commands_table,
     mark_api_command_failed,
     mark_api_command_published,
@@ -38,6 +39,7 @@ def create_api_app(
     config: AppConfig,
     mqtt_client: Any,
     database_path: str | Path,
+    odoo_worker: Any | None = None,
 ) -> FastAPI:
     """Create the BEB FastAPI application."""
     initialize_api_commands_table(database_path)
@@ -64,12 +66,18 @@ def create_api_app(
 
     @app.get("/health")
     def health() -> dict[str, object]:
+        worker_health = _worker_health(config, odoo_worker, database_path)
+        status = "ok"
+        if config.odoo_enabled and not worker_health["worker_healthy"]:
+            status = "degraded"
+
         return {
             "service": "BlackBear Edge Bridge",
-            "status": "ok",
+            "status": status,
             "mqtt_connected": _mqtt_connected(mqtt_client),
             "odoo_enabled": config.odoo_enabled,
             "api_enabled": config.beb_api_enabled,
+            **worker_health,
         }
 
     @app.post("/api/v1/plc/command")
@@ -281,6 +289,30 @@ def _mqtt_connected(mqtt_client: Any) -> bool:
         return bool(is_connected())
 
     return False
+
+
+def _worker_health(
+    config: AppConfig,
+    odoo_worker: Any | None,
+    database_path: str | Path,
+) -> dict[str, object]:
+    if odoo_worker is not None:
+        health_snapshot = getattr(odoo_worker, "health_snapshot", None)
+        if callable(health_snapshot):
+            return dict(health_snapshot(config.odoo_worker_heartbeat_seconds))
+
+    counts = get_queue_counts(database_path)
+    return {
+        "worker_running": False,
+        "worker_healthy": not config.odoo_enabled,
+        "worker_last_heartbeat": None,
+        "worker_current_message_id": None,
+        "worker_current_processing_seconds": None,
+        "queue_new_count": counts.get("NEW", 0),
+        "queue_processing_count": counts.get("PROCESSING", 0),
+        "queue_failed_count": counts.get("FAILED", 0),
+        "queue_completed_count": counts.get("COMPLETED", 0),
+    }
 
 
 def _get_duplicate_response(

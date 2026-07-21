@@ -649,14 +649,31 @@ def mark_failed(
 def reset_stale_processing(
     stale_before: str,
     database_path: str | Path = DEFAULT_DATABASE_PATH,
+    exclude_ids: set[int] | tuple[int, ...] | list[int] = (),
 ) -> int:
     """Recover stale PROCESSING records left by an interrupted process."""
     initialize_database(database_path)
     recovered_at = _format_timestamp(datetime.now(timezone.utc))
+    excluded = tuple(int(value) for value in exclude_ids)
+    excluded_sql = ""
+    parameters: tuple[object, ...]
+    base_parameters: tuple[object, ...] = (
+        "FAILED",
+        "Recovered stale PROCESSING message after timeout",
+        recovered_at,
+        "PROCESSING",
+        stale_before,
+    )
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        excluded_sql = f" AND id NOT IN ({placeholders})"
+        parameters = (*base_parameters, *excluded)
+    else:
+        parameters = base_parameters
 
     with _open_connection(database_path) as connection:
         cursor = connection.execute(
-            """
+            f"""
             UPDATE mqtt_messages
             SET status = ?,
                 retry_count = retry_count + 1,
@@ -664,14 +681,9 @@ def reset_stale_processing(
                 last_attempt_at = ?
             WHERE status = ?
               AND (last_attempt_at IS NULL OR last_attempt_at < ?)
+              {excluded_sql}
             """,
-            (
-                "FAILED",
-                "Recovered stale PROCESSING message after timeout",
-                recovered_at,
-                "PROCESSING",
-                stale_before,
-            ),
+            parameters,
         )
         return int(cursor.rowcount)
 
