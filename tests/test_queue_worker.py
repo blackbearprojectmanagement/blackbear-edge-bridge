@@ -19,6 +19,20 @@ from app.queue_worker import OdooQueueWorker
 DEFAULT_RESPONSE = ("__default_response__",)
 
 
+class StickyMonotonic:
+    def __init__(self, values: list[float]) -> None:
+        self._values = values
+        self._index = 0
+
+    def __call__(self) -> float:
+        if self._index >= len(self._values):
+            return self._values[-1]
+
+        value = self._values[self._index]
+        self._index += 1
+        return value
+
+
 class FakeOdooClient:
     def __init__(
         self,
@@ -168,9 +182,10 @@ class TestOdooQueueWorker(unittest.TestCase):
             response={"success": True, "result": {"ACK": "3242", "ok": True}}
         )
         worker = self._worker(fake_client)
+        clock = StickyMonotonic([10.0, 10.0, 10.1, 10.125])
 
         with (
-            patch("app.queue_worker.time.monotonic", side_effect=[10.0, 10.0, 10.1, 10.125]),
+            patch("app.queue_worker.time.monotonic", side_effect=clock),
             self.assertLogs("app.queue_worker", level="INFO") as logs,
         ):
             worker.run_once()
@@ -194,9 +209,10 @@ class TestOdooQueueWorker(unittest.TestCase):
         saved = self._save_raw('{"MN":"106-020C012P001 3242T01"}')
         fake_client = FakeOdooClient(fail_on=1)
         worker = self._worker(fake_client)
+        clock = StickyMonotonic([20.0, 20.0, 20.5])
 
         with (
-            patch("app.queue_worker.time.monotonic", side_effect=[20.0, 20.0, 20.5]),
+            patch("app.queue_worker.time.monotonic", side_effect=clock),
             self.assertLogs("app.queue_worker", level="INFO") as logs,
         ):
             worker.run_once()
