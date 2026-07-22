@@ -414,7 +414,242 @@ Optional local API check:
 python -m scripts.test_beb_api
 ```
 
-## Ubuntu Deployment
+## Docker Deployment
+
+Docker is the reference deployment path for BBA validation before migration to BBW production. The real `.env` file remains local to each machine and is ignored by Git. Only `.env.example` is tracked.
+
+Deployment workflow:
+
+```text
+Developer PC
+ |
+ | git push
+ v
+BBA Ubuntu laptop
+ |
+ | git pull
+ | docker compose up -d --build
+ v
+Validation
+ |
+ v
+Deploy to BBW
+```
+
+Runtime architecture:
+
+```text
+AWS-hosted Odoo
+ |
+ | HTTPS / tunnel / VPN / reverse proxy
+ v
+BBA or BBW Docker host
+ |
+ +-- beb container
+ |    |
+ |    +-- /app/data/bridge.db
+ |        persisted in Docker volume: beb-sqlite-data
+ |
+ +-- beb-mosquitto container
+      |
+      +-- /mosquitto/config/mosquitto.conf
+      |   tracked from docker/mosquitto/mosquitto.conf
+      |
+      +-- /mosquitto/data
+      |   persisted in Docker volume: beb-mosquitto-data
+      |
+      +-- /mosquitto/log
+          persisted in Docker volume: beb-mosquitto-log
+```
+
+Docker installation on Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+. /etc/os-release
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker --version
+docker compose version
+```
+
+First deployment on BBA:
+
+```bash
+git clone https://github.com/blackbearprojectmanagement/blackbear-edge-bridge.git
+cd blackbear-edge-bridge
+cp .env.example .env
+nano .env
+docker compose config
+docker compose up -d --build
+docker compose ps
+```
+
+For Docker, Compose loads deployment values from `.env` and sets container-only overrides automatically:
+
+```text
+MQTT_HOST=mosquitto
+MQTT_PORT=1883
+DATABASE_PATH=/app/data/bridge.db
+BEB_API_ENABLED=true
+BEB_API_HOST=0.0.0.0
+BEB_API_PORT=8000
+```
+
+Set deployment-specific values in `.env`, especially:
+
+```env
+ODOO_ENABLED=true
+ODOO_PASSWORD=<set-on-host-only>
+BEB_API_ENABLED=true
+BEB_API_USERNAME=odoo
+BEB_API_PASSWORD=<set-on-host-only>
+```
+
+If a secret contains `$`, keep it in `.env`, single-quote the value, and do not add it directly to `docker-compose.yml`:
+
+```env
+ODOO_PASSWORD='value-with-$-characters'
+BEB_API_PASSWORD='value-with-$-characters'
+```
+
+By default the API and MQTT ports are bound to localhost on the Docker host:
+
+```env
+BEB_API_BIND=127.0.0.1
+BEB_API_HOST_PORT=8000
+MQTT_BIND=127.0.0.1
+MQTT_HOST_PORT=1883
+```
+
+If a PLC or validation client must connect to Mosquitto from the LAN, set `MQTT_BIND` to the Docker host LAN IP and restrict access with host firewall rules. Do not expose MQTT port `1883` to the public internet.
+
+Updating from Git:
+
+```bash
+cd blackbear-edge-bridge
+git pull
+docker compose config
+docker compose up -d --build
+docker compose ps
+```
+
+Rebuilding without changing Git state:
+
+```bash
+docker compose build --no-cache beb
+docker compose up -d
+```
+
+Restarting:
+
+```bash
+docker compose restart
+docker compose restart beb
+docker compose restart mosquitto
+```
+
+Viewing logs:
+
+```bash
+docker compose logs -f
+docker compose logs -f beb
+docker compose logs -f mosquitto
+```
+
+Health checks:
+
+```bash
+docker compose ps
+curl http://127.0.0.1:8000/health
+```
+
+Backup SQLite:
+
+```bash
+mkdir -p backups
+docker compose exec -T beb python -c "import sqlite3; src=sqlite3.connect('/app/data/bridge.db'); dst=sqlite3.connect('/app/data/bridge-backup.db'); src.backup(dst); src.close(); dst.close()"
+docker cp beb:/app/data/bridge-backup.db "backups/bridge-$(date +%Y%m%d-%H%M%S).db"
+docker compose exec -T beb rm -f /app/data/bridge-backup.db
+```
+
+Restore SQLite:
+
+```bash
+docker compose stop beb
+docker cp backups/bridge-YYYYMMDD-HHMMSS.db beb:/app/data/bridge.db
+docker compose start beb
+docker compose logs -f beb
+```
+
+Docker troubleshooting:
+
+```bash
+docker compose config
+docker compose ps
+docker compose logs --tail=200 beb
+docker compose logs --tail=200 mosquitto
+docker inspect beb --format '{{json .State.Health}}'
+docker inspect beb-mosquitto --format '{{json .State.Health}}'
+docker volume ls | grep beb
+docker network inspect beb-net
+```
+
+Common checks:
+
+- If BEB cannot connect to MQTT, verify the `beb-mosquitto` container is healthy and `MQTT_HOST` resolves to `mosquitto` inside Compose.
+- If `/health` is unreachable from the host, verify `BEB_API_ENABLED=true` and the `BEB_API_BIND:BEB_API_HOST_PORT` mapping.
+- If Odoo forwarding is disabled, verify `ODOO_ENABLED=true` in the host `.env`.
+- If Docker starts after reboot but BEB is unhealthy, review `docker compose logs beb` before rebuilding.
+- If a port is already in use, change `BEB_API_HOST_PORT` or `MQTT_HOST_PORT` in `.env`.
+
+Restart policy:
+
+```yaml
+restart: unless-stopped
+```
+
+Both BEB and Mosquitto use this policy, so containers automatically restart after an Ubuntu reboot unless they were manually stopped.
+
+Recommended production Docker architecture:
+
+```text
+Odoo
+ |
+ | HTTPS through Cloudflare Tunnel, VPN, or authenticated reverse proxy
+ v
+BBW Docker host
+ |
+ +-- Reverse proxy or tunnel endpoint
+ |    |
+ |    v
+ |   beb:8000 on private Docker network
+ |
+ +-- beb container
+ |    |
+ |    +-- SQLite Docker volume with scheduled host backups
+ |    |
+ |    +-- MQTT client connection to mosquitto:1883
+ |
+ +-- beb-mosquitto container
+      |
+      +-- MQTT exposed only to localhost or trusted LAN interface
+      +-- Persistent Mosquitto data volume
+      +-- Tracked Mosquitto config
+```
+
+For BBW production, keep secrets in the host `.env`, run `docker compose config` before each deployment, validate on BBA first, and back up `beb-sqlite-data` before migration.
+
+## Native Ubuntu Deployment
+
+Native Python deployment remains documented for reference. Docker is the preferred BBA validation path before BBW production migration.
 
 ```bash
 sudo apt update

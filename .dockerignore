@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/
+logs/
+odoo_sample/
+xmlrpc_print_client/
+xmlrpc_print_client.zip
+tests/
+*.log
