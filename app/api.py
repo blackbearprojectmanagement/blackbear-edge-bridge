@@ -274,6 +274,37 @@ def create_api_app(
                 return duplicate
             raise
 
+        br_refresh_result = _refresh_ready_before_print_job_start(
+            command,
+            mqtt_client,
+            readiness_monitor,
+        )
+        if br_refresh_result is not None and not br_refresh_result.success:
+            error = br_refresh_result.error or "MQTT broker unavailable"
+            mark_api_command_failed(
+                request_id,
+                error,
+                database_path,
+                mqtt_rc=br_refresh_result.rc,
+                mqtt_mid=br_refresh_result.mid,
+            )
+            response_body = {
+                "success": False,
+                "status": "failed",
+                "request_id": request_id,
+                "error": error,
+            }
+            response = _stored_json_response(request_id, 503, response_body, database_path)
+            LOGGER.error(
+                "\n%s",
+                format_api_failure_log(
+                    request_id=request_id,
+                    status="FAILED",
+                    error=error,
+                ),
+            )
+            return response
+
         result: PublishResult = mqtt_client.publish_plc_command(command)
         if result.success:
             mark_api_command_published(
@@ -392,6 +423,52 @@ def _mqtt_connected(mqtt_client: Any) -> bool:
         return bool(is_connected())
 
     return False
+
+
+def _refresh_ready_before_print_job_start(
+    command: dict[str, str],
+    mqtt_client: Any,
+    readiness_monitor: Any | None,
+) -> PublishResult | None:
+    if "messt01" not in command:
+        return None
+
+    readiness_state = _current_readiness_state(readiness_monitor)
+    if readiness_state != "READY":
+        LOGGER.info(
+            "BR refresh skipped because readiness state is %s",
+            readiness_state,
+        )
+        return None
+
+    if not _mqtt_connected(mqtt_client):
+        LOGGER.info("BR refresh skipped because MQTT is disconnected")
+        return None
+
+    LOGGER.info("Print-job start detected; refreshing BR=1 before command publish")
+    publish_readiness = getattr(mqtt_client, "publish_readiness", None)
+    if not callable(publish_readiness):
+        return PublishResult(
+            success=False,
+            rc=0,
+            mid=None,
+            topic="",
+            payload='{"BR":1}',
+            error="MQTT readiness publisher unavailable",
+        )
+    return publish_readiness(1)
+
+
+def _current_readiness_state(readiness_monitor: Any | None) -> str:
+    if readiness_monitor is None:
+        return "UNKNOWN"
+
+    snapshot = getattr(readiness_monitor, "snapshot", None)
+    if not callable(snapshot):
+        return "UNKNOWN"
+
+    value = snapshot()
+    return str(getattr(value, "state", "UNKNOWN"))
 
 
 def _worker_health(

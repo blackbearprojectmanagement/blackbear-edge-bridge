@@ -41,14 +41,16 @@ class FakeMqttClient:
         self.success = success
         self.error = error
         self.calls: list[dict[str, str]] = []
+        self.published_payloads: list[dict[str, object]] = []
 
     def is_connected(self) -> bool:
         return self.connected
 
     def publish_plc_command(self, payload: dict[str, str]) -> PublishResult:
-        self.calls.append(payload)
+        command_payload = dict(payload)
+        self.calls.append(command_payload)
         plc_payload = json.dumps(payload, separators=PLC_JSON_SEPARATORS)
-        if not self.success:
+        if not self.connected or not self.success:
             return PublishResult(
                 success=False,
                 rc=mqtt.MQTT_ERR_NO_CONN,
@@ -57,12 +59,24 @@ class FakeMqttClient:
                 payload=plc_payload,
                 error=self.error or "MQTT broker unavailable",
             )
+        self.published_payloads.append(command_payload)
         return PublishResult(
             success=True,
             rc=mqtt.MQTT_ERR_SUCCESS,
             mid=12,
             topic="MQTT/ODOO_TO_PLC/topic",
             payload=plc_payload,
+        )
+
+    def publish_readiness(self, br_value: int) -> PublishResult:
+        payload = {"BR": br_value}
+        self.published_payloads.append(payload)
+        return PublishResult(
+            success=True,
+            rc=mqtt.MQTT_ERR_SUCCESS,
+            mid=11,
+            topic="MQTT/ODOO_TO_PLC/topic",
+            payload=json.dumps(payload, separators=(",", ":")),
         )
 
 
@@ -546,6 +560,91 @@ class TestBebApi(ApiTestCase):
         self.assertEqual(recent.json()["items"][0]["ack"], "7777")
         self.assertEqual(daily.json()["items"][0]["production_count"], 1)
         self.assertEqual(summary.json()["production_count"], 1)
+
+    def test_ready_print_job_refreshes_br_before_command_publish(self) -> None:
+        fake_mqtt = FakeMqttClient(connected=True)
+        client, _ = self.make_client(
+            mqtt_client=fake_mqtt,
+            readiness_monitor=FakeReadinessMonitor("READY"),
+            beb_ready_enabled=True,
+        )
+
+        response = self.post_command(client, {"messt01": "S100-035C015P001"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_mqtt.published_payloads,
+            [{"BR": 1}, {"messt01": "S100-035C015P001"}],
+        )
+
+    def test_not_ready_print_job_skips_br_refresh(self) -> None:
+        fake_mqtt = FakeMqttClient(connected=True)
+        client, _ = self.make_client(
+            mqtt_client=fake_mqtt,
+            readiness_monitor=FakeReadinessMonitor("NOT_READY"),
+            beb_ready_enabled=True,
+        )
+
+        response = self.post_command(client, {"messt01": "S100-035C015P001"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_mqtt.published_payloads, [{"messt01": "S100-035C015P001"}])
+
+    def test_unknown_readiness_print_job_skips_br_refresh(self) -> None:
+        fake_mqtt = FakeMqttClient(connected=True)
+        client, _ = self.make_client(
+            mqtt_client=fake_mqtt,
+            readiness_monitor=FakeReadinessMonitor("UNKNOWN"),
+            beb_ready_enabled=True,
+        )
+
+        response = self.post_command(client, {"messt01": "S100-035C015P001"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_mqtt.published_payloads, [{"messt01": "S100-035C015P001"}])
+
+    def test_ready_non_print_command_skips_br_refresh(self) -> None:
+        fake_mqtt = FakeMqttClient(connected=True)
+        client, _ = self.make_client(
+            mqtt_client=fake_mqtt,
+            readiness_monitor=FakeReadinessMonitor("READY"),
+            beb_ready_enabled=True,
+        )
+
+        response = self.post_command(client, {"T01": "P"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_mqtt.published_payloads, [{"T01": "P"}])
+
+    def test_disconnected_mqtt_print_job_skips_br_refresh_and_preserves_failure(self) -> None:
+        fake_mqtt = FakeMqttClient(connected=False)
+        client, _ = self.make_client(
+            mqtt_client=fake_mqtt,
+            readiness_monitor=FakeReadinessMonitor("READY"),
+            beb_ready_enabled=True,
+        )
+
+        response = self.post_command(client, {"messt01": "S100-035C015P001"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertEqual(fake_mqtt.calls, [{"messt01": "S100-035C015P001"}])
+        self.assertEqual(fake_mqtt.published_payloads, [])
+
+    def test_br_refresh_does_not_mutate_original_request_payload(self) -> None:
+        payload = {"messt01": "S100-035C015P001"}
+        fake_mqtt = FakeMqttClient(connected=True)
+        client, _ = self.make_client(
+            mqtt_client=fake_mqtt,
+            readiness_monitor=FakeReadinessMonitor("READY"),
+            beb_ready_enabled=True,
+        )
+
+        response = self.post_command(client, payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload, {"messt01": "S100-035C015P001"})
+        self.assertEqual(response.json()["payload"], {"messt01": "S100-035C015P001"})
 
 
 class TestMqttCommandPublishing(unittest.TestCase):
