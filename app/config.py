@@ -48,6 +48,13 @@ class AppConfig:
     beb_ready_disconnect_delay_seconds: int = 5
     beb_ready_recovery_delay_seconds: int = 10
     beb_ready_topic: str = "MQTT/ODOO_TO_PLC/topic"
+    machine_id: str = "BEB"
+    sqlite_raw_retention_days: int = 30
+    sqlite_cleanup_enabled: bool = True
+    sqlite_cleanup_interval_hours: int = 24
+    sqlite_cleanup_batch_size: int = 1000
+    sqlite_vacuum_enabled: bool = False
+    sqlite_reconcile_batch_size: int = 100
 
 
 def _get_int(name: str, default: int) -> int:
@@ -78,11 +85,12 @@ def _get_bool(name: str, default: bool) -> bool:
 def load_config() -> AppConfig:
     """Load application configuration from .env and process environment."""
     load_dotenv()
+    mqtt_client_id = os.getenv("MQTT_CLIENT_ID", "BLACKBEAR_PYTHON_BRIDGE_DEV")
 
     return AppConfig(
         mqtt_host=os.getenv("MQTT_HOST", "localhost"),
         mqtt_port=_get_int("MQTT_PORT", 1883),
-        mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "BLACKBEAR_PYTHON_BRIDGE_DEV"),
+        mqtt_client_id=mqtt_client_id,
         mqtt_plc_to_odoo_topic=os.getenv(
             "MQTT_PLC_TO_ODOO_TOPIC", "MQTT/PLC_TO_ODOO/topic"
         ),
@@ -92,6 +100,7 @@ def load_config() -> AppConfig:
         mqtt_keepalive=_get_int("MQTT_KEEPALIVE", 60),
         database_path=Path(os.getenv("DATABASE_PATH", "data/bridge.db")),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        machine_id=os.getenv("BEB_MACHINE_ID", mqtt_client_id),
         odoo_enabled=_get_bool("ODOO_ENABLED", False),
         odoo_url=os.getenv("ODOO_URL", "https://test-bbw.odoo.com"),
         odoo_database=os.getenv(
@@ -143,4 +152,10 @@ def load_config() -> AppConfig:
         beb_ready_topic=os.getenv(
             "BEB_READY_TOPIC", "MQTT/ODOO_TO_PLC/topic"
         ),
+        sqlite_raw_retention_days=_get_int("SQLITE_RAW_RETENTION_DAYS", 30),
+        sqlite_cleanup_enabled=_get_bool("SQLITE_CLEANUP_ENABLED", True),
+        sqlite_cleanup_interval_hours=_get_int("SQLITE_CLEANUP_INTERVAL_HOURS", 24),
+        sqlite_cleanup_batch_size=_get_int("SQLITE_CLEANUP_BATCH_SIZE", 1000),
+        sqlite_vacuum_enabled=_get_bool("SQLITE_VACUUM_ENABLED", False),
+        sqlite_reconcile_batch_size=_get_int("SQLITE_RECONCILE_BATCH_SIZE", 100),
     )

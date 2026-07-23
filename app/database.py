@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 
+LOGGER = logging.getLogger(__name__)
 DEFAULT_DATABASE_PATH = Path("data/bridge.db")
 VALID_STATUSES = frozenset({"NEW", "PROCESSING", "COMPLETED", "FAILED"})
 StatusValue = Literal["NEW", "PROCESSING", "COMPLETED", "FAILED"]
@@ -53,6 +56,9 @@ MIGRATION_COLUMNS = {
 ACK_REPLAY_MAX_COUNT = 3
 ACK_REPLAY_MIN_INTERVAL = timedelta(seconds=2)
 ACK_REPLAY_WINDOW = timedelta(seconds=30)
+DEFAULT_MACHINE_ID = "BEB"
+SUMMARY_TEXT_SENTINEL = ""
+SUMMARY_INT_SENTINEL = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +128,55 @@ class ApiCommandRecord:
     last_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ProductionRecord:
+    id: int
+    mqtt_message_id: int
+    completed_at: str
+    production_date: str
+    message_type: str
+    machine_id: str
+    table_no: str
+    model: str
+    serial: str
+    ack: str
+    customer_id: int | None
+    customer_name: str | None
+    operator_id: int | None
+    operator_name: str | None
+    number_of_operators: int | None
+    batch_number: str | None
+    status: str
+    raw_odoo_response: str
+    created_at: str
+    summary_applied: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationResult:
+    scanned_rows: int
+    recovered_records: int
+    recovered_summaries: int
+    skipped_rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupResult:
+    deleted_mqtt_messages: int
+    deleted_api_commands: int
+    deleted_production_records: int
+    vacuum_ran: bool = False
+    error: str | None = None
+
+    @property
+    def total_deleted_rows(self) -> int:
+        return (
+            self.deleted_mqtt_messages
+            + self.deleted_api_commands
+            + self.deleted_production_records
+        )
+
+
 def initialize_database(database_path: str | Path = DEFAULT_DATABASE_PATH) -> None:
     """Create or migrate the SQLite database without destroying existing data."""
     db_path = Path(database_path)
@@ -159,6 +214,13 @@ def initialize_database(database_path: str | Path = DEFAULT_DATABASE_PATH) -> No
             ON mqtt_messages (status, retry_count, id)
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mqtt_messages_status_completed_at
+            ON mqtt_messages (status, completed_at)
+            """
+        )
+        _initialize_production_tables(connection)
 
 
 def initialize_api_commands_table(
@@ -561,12 +623,46 @@ def mark_completed(
     customer_name: str | None = None,
     operator_id: int | None = None,
     operator_name: str | None = None,
+    number_of_operators: int | None = None,
     batch_number: str | None = None,
+    machine_id: str | None = None,
 ) -> None:
     """Mark a queue row COMPLETED and store the returned Odoo response."""
     initialize_database(database_path)
 
     with _open_connection(database_path) as connection:
+        source = connection.execute(
+            f"""
+            SELECT {_record_columns_sql()}
+            FROM mqtt_messages
+            WHERE id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if source is None:
+            raise ValueError(f"Message id not found: {message_id}")
+
+        metadata: dict[str, object | None] = {
+            "customer_id": None,
+            "customer_name": None,
+            "operator_id": None,
+            "operator_name": None,
+            "number_of_operators": None,
+            "batch_number": None,
+        }
+        if ack:
+            metadata = _production_metadata_from_response(odoo_response, message_id)
+        customer_id = customer_id if customer_id is not None else metadata["customer_id"]
+        customer_name = customer_name if customer_name is not None else metadata["customer_name"]
+        operator_id = operator_id if operator_id is not None else metadata["operator_id"]
+        operator_name = operator_name if operator_name is not None else metadata["operator_name"]
+        number_of_operators = (
+            number_of_operators
+            if number_of_operators is not None
+            else metadata["number_of_operators"]
+        )
+        batch_number = batch_number if batch_number is not None else metadata["batch_number"]
+
         cursor = connection.execute(
             """
             UPDATE mqtt_messages
@@ -599,6 +695,22 @@ def mark_completed(
         )
         if cursor.rowcount != 1:
             raise ValueError(f"Message id not found: {message_id}")
+
+        if ack:
+            _upsert_production_record_and_summary(
+                connection=connection,
+                source=source,
+                completed_at=completed_at,
+                machine_id=machine_id or DEFAULT_MACHINE_ID,
+                ack=ack,
+                customer_id=customer_id,
+                customer_name=customer_name,
+                operator_id=operator_id,
+                operator_name=operator_name,
+                number_of_operators=number_of_operators,
+                batch_number=batch_number,
+                raw_odoo_response=odoo_response,
+            )
 
 
 def mark_failed(
@@ -825,6 +937,371 @@ def get_queue_counts(
     return counts
 
 
+def reconcile_completed_production_records(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    machine_id: str = DEFAULT_MACHINE_ID,
+    limit: int = 100,
+) -> ReconciliationResult:
+    """Idempotently summarize bounded completed rows without Odoo or MQTT side effects."""
+    initialize_database(database_path)
+    if limit <= 0:
+        return ReconciliationResult(0, 0, 0, 0)
+
+    scanned_rows = recovered_records = recovered_summaries = skipped_rows = 0
+    with _open_connection(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT {_record_columns_sql("m")}
+            FROM mqtt_messages AS m
+            LEFT JOIN production_records AS p
+              ON p.mqtt_message_id = m.id
+            WHERE m.status = 'COMPLETED'
+              AND m.completed_at IS NOT NULL
+              AND m.odoo_response IS NOT NULL
+              AND m.ack IS NOT NULL
+              AND (p.id IS NULL OR p.summary_applied = 0)
+            ORDER BY m.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        for row in rows:
+            scanned_rows += 1
+            try:
+                summary_applied_before = _production_summary_applied(
+                    connection,
+                    int(row["id"]),
+                )
+                metadata = _production_metadata_from_response(
+                    str(row["odoo_response"]),
+                    int(row["id"]),
+                )
+                applied = _upsert_production_record_and_summary(
+                    connection=connection,
+                    source=row,
+                    completed_at=str(row["completed_at"]),
+                    machine_id=machine_id,
+                    ack=str(row["ack"]),
+                    customer_id=metadata["customer_id"],
+                    customer_name=metadata["customer_name"],
+                    operator_id=metadata["operator_id"],
+                    operator_name=metadata["operator_name"],
+                    number_of_operators=metadata["number_of_operators"],
+                    batch_number=metadata["batch_number"],
+                    raw_odoo_response=str(row["odoo_response"]),
+                )
+                if applied:
+                    recovered_summaries += 1
+                if not summary_applied_before:
+                    recovered_records += 1
+            except Exception as exc:
+                skipped_rows += 1
+                LOGGER.warning(
+                    "Skipped production reconciliation for mqtt_message_id=%s error=%s",
+                    row["id"],
+                    exc,
+                )
+
+    if recovered_records or recovered_summaries:
+        LOGGER.info(
+            "Production reconciliation recovered records=%s summaries=%s scanned=%s skipped=%s",
+            recovered_records,
+            recovered_summaries,
+            scanned_rows,
+            skipped_rows,
+        )
+    return ReconciliationResult(
+        scanned_rows=scanned_rows,
+        recovered_records=recovered_records,
+        recovered_summaries=recovered_summaries,
+        skipped_rows=skipped_rows,
+    )
+
+
+def cleanup_raw_operational_data(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    retention_days: int = 30,
+    batch_size: int = 1000,
+    vacuum_enabled: bool = False,
+    now: datetime | None = None,
+) -> CleanupResult:
+    """Delete only old summarized raw records in bounded batches."""
+    initialize_database(database_path)
+    if retention_days < 0:
+        raise ValueError("retention_days must be >= 0")
+    if batch_size <= 0:
+        return CleanupResult(0, 0, 0, False)
+
+    cutoff = _format_timestamp((now or datetime.now(timezone.utc)) - timedelta(days=retention_days))
+    deleted_mqtt = deleted_api = deleted_production = 0
+
+    try:
+        with _open_connection(database_path) as connection:
+            completed_ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    """
+                    SELECT m.id
+                    FROM mqtt_messages AS m
+                    JOIN production_records AS p
+                      ON p.mqtt_message_id = m.id
+                    WHERE m.status = 'COMPLETED'
+                      AND m.completed_at < ?
+                      AND p.summary_applied = 1
+                    ORDER BY m.id ASC
+                    LIMIT ?
+                    """,
+                    (cutoff, batch_size),
+                ).fetchall()
+            ]
+            if completed_ids:
+                placeholders = ",".join("?" for _ in completed_ids)
+                deleted_mqtt = int(
+                    connection.execute(
+                        f"DELETE FROM mqtt_messages WHERE id IN ({placeholders})",
+                        completed_ids,
+                    ).rowcount
+                )
+
+            remaining_batch = max(0, batch_size - deleted_mqtt)
+            if remaining_batch:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM api_commands
+                    WHERE id IN (
+                        SELECT id
+                        FROM api_commands
+                        WHERE status IN ('PUBLISHED', 'FAILED', 'REJECTED', 'DUPLICATE')
+                          AND received_at < ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, remaining_batch),
+                )
+                deleted_api = int(cursor.rowcount)
+
+            remaining_batch = max(0, batch_size - deleted_mqtt - deleted_api)
+            if remaining_batch:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM production_records
+                    WHERE id IN (
+                        SELECT id
+                        FROM production_records
+                        WHERE summary_applied = 1
+                          AND completed_at < ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, remaining_batch),
+                )
+                deleted_production = int(cursor.rowcount)
+
+        vacuum_ran = False
+        if vacuum_enabled and (deleted_mqtt or deleted_api or deleted_production):
+            with _connect(database_path) as connection:
+                connection.execute("VACUUM")
+                vacuum_ran = True
+
+        result = CleanupResult(
+            deleted_mqtt_messages=deleted_mqtt,
+            deleted_api_commands=deleted_api,
+            deleted_production_records=deleted_production,
+            vacuum_ran=vacuum_ran,
+        )
+        if result.total_deleted_rows:
+            LOGGER.info(
+                "SQLite raw cleanup deleted mqtt_messages=%s api_commands=%s production_records=%s vacuum=%s",
+                deleted_mqtt,
+                deleted_api,
+                deleted_production,
+                vacuum_ran,
+            )
+        else:
+            LOGGER.debug("SQLite raw cleanup deleted 0 row(s)")
+        return result
+    except Exception as exc:
+        LOGGER.exception("SQLite raw cleanup failed")
+        return CleanupResult(0, 0, 0, False, str(exc))
+
+
+def get_database_status(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    retention_days: int = 30,
+    cleanup_enabled: bool = True,
+    last_cleanup_at: str | None = None,
+    last_cleanup_deleted_rows: int | None = None,
+    last_cleanup_error: str | None = None,
+) -> dict[str, object]:
+    """Return lightweight SQLite size and lifecycle metrics for health reporting."""
+    initialize_database(database_path)
+    initialize_api_commands_table(database_path)
+    db_path = Path(database_path)
+    with _open_connection(db_path) as connection:
+        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        freelist_count = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+        production_records_count = int(
+            connection.execute("SELECT COUNT(*) FROM production_records").fetchone()[0]
+        )
+        daily_summary_count = int(
+            connection.execute("SELECT COUNT(*) FROM daily_production_summary").fetchone()[0]
+        )
+        oldest_raw_record_at = connection.execute(
+            """
+            SELECT MIN(value) AS oldest_raw_record_at
+            FROM (
+                SELECT received_at AS value FROM mqtt_messages
+                UNION ALL
+                SELECT received_at AS value FROM api_commands
+                UNION ALL
+                SELECT completed_at AS value FROM production_records
+            )
+            WHERE value IS NOT NULL
+            """
+        ).fetchone()["oldest_raw_record_at"]
+
+    return {
+        "sqlite_database_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        "sqlite_page_count": page_count,
+        "sqlite_page_size": page_size,
+        "sqlite_freelist_count": freelist_count,
+        "production_records_count": production_records_count,
+        "daily_summary_count": daily_summary_count,
+        "oldest_raw_record_at": oldest_raw_record_at,
+        "retention_days": retention_days,
+        "cleanup_enabled": cleanup_enabled,
+        "last_cleanup_at": last_cleanup_at,
+        "last_cleanup_deleted_rows": last_cleanup_deleted_rows,
+        "last_cleanup_error": last_cleanup_error,
+    }
+
+
+def query_recent_production_records(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    table_no: str | None = None,
+    model: str | None = None,
+    customer_id: int | None = None,
+    batch_number: str | None = None,
+    operator_id: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, object]]:
+    initialize_database(database_path)
+    where, parameters = _dashboard_filters(
+        date_column="completed_at",
+        date_from=date_from,
+        date_to=date_to,
+        table_no=table_no,
+        model=model,
+        customer_id=customer_id,
+        batch_number=batch_number,
+        operator_id=operator_id,
+    )
+    safe_limit = _bounded_limit(limit)
+    with _open_connection(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT id, mqtt_message_id, completed_at, production_date, message_type,
+                   machine_id, table_no, model, serial, ack, customer_id, customer_name,
+                   operator_id, operator_name, number_of_operators, batch_number, status
+            FROM production_records
+            {where}
+            ORDER BY completed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*parameters, safe_limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_daily_production_summary(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    table_no: str | None = None,
+    model: str | None = None,
+    customer_id: int | None = None,
+    batch_number: str | None = None,
+    operator_id: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, object]]:
+    initialize_database(database_path)
+    where, parameters = _dashboard_filters(
+        date_column="production_date",
+        date_from=date_from,
+        date_to=date_to,
+        table_no=table_no,
+        model=model,
+        customer_id=customer_id,
+        batch_number=batch_number,
+        operator_id=operator_id,
+    )
+    safe_limit = _bounded_limit(limit)
+    with _open_connection(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT production_date, machine_id, table_no, model, customer_id,
+                   customer_name, batch_number, operator_id, operator_name,
+                   number_of_operators, production_count, first_ack, last_ack,
+                   first_completed_at, last_completed_at
+            FROM daily_production_summary
+            {where}
+            ORDER BY production_date DESC, table_no, model
+            LIMIT ?
+            """,
+            (*parameters, safe_limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_production_summary_totals(
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    table_no: str | None = None,
+    model: str | None = None,
+    customer_id: int | None = None,
+    batch_number: str | None = None,
+    operator_id: int | None = None,
+) -> dict[str, object]:
+    initialize_database(database_path)
+    where, parameters = _dashboard_filters(
+        date_column="production_date",
+        date_from=date_from,
+        date_to=date_to,
+        table_no=table_no,
+        model=model,
+        customer_id=customer_id,
+        batch_number=batch_number,
+        operator_id=operator_id,
+    )
+    with _open_connection(database_path) as connection:
+        row = connection.execute(
+            f"""
+            SELECT COALESCE(SUM(production_count), 0) AS production_count,
+                   MIN(first_completed_at) AS first_completed_at,
+                   MAX(last_completed_at) AS last_completed_at,
+                   MIN(production_date) AS first_production_date,
+                   MAX(production_date) AS last_production_date
+            FROM daily_production_summary
+            {where}
+            """,
+            parameters,
+        ).fetchone()
+    return dict(row)
+
+
 def generate_message_hash(topic: str, raw_payload: str) -> str:
     """Generate the unique message identity from topic and raw payload."""
     return hashlib.sha256(f"{topic}{raw_payload}".encode("utf-8")).hexdigest()
@@ -867,6 +1344,493 @@ def _migrate_mqtt_messages(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE mqtt_messages ADD COLUMN {column_name} {definition}"
             )
+
+
+def _initialize_production_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS production_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mqtt_message_id INTEGER NOT NULL UNIQUE,
+            completed_at TEXT NOT NULL,
+            production_date TEXT NOT NULL,
+            message_type TEXT NOT NULL,
+            machine_id TEXT NOT NULL,
+            table_no TEXT NOT NULL,
+            model TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            ack TEXT NOT NULL,
+            customer_id INTEGER,
+            customer_name TEXT,
+            operator_id INTEGER,
+            operator_name TEXT,
+            number_of_operators INTEGER,
+            batch_number TEXT,
+            status TEXT NOT NULL,
+            raw_odoo_response TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            summary_applied INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_production_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            production_date TEXT NOT NULL,
+            machine_id TEXT NOT NULL,
+            table_no TEXT NOT NULL,
+            model TEXT NOT NULL,
+            customer_id INTEGER,
+            customer_name TEXT,
+            batch_number TEXT,
+            operator_id INTEGER,
+            operator_name TEXT,
+            number_of_operators INTEGER,
+            production_count INTEGER NOT NULL DEFAULT 0,
+            first_ack TEXT,
+            last_ack TEXT,
+            first_completed_at TEXT,
+            last_completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_production_records_mqtt_message_id
+        ON production_records (mqtt_message_id)
+        """
+    )
+    for index_name, column in (
+        ("idx_production_records_completed_at", "completed_at"),
+        ("idx_production_records_production_date", "production_date"),
+        ("idx_production_records_table_no", "table_no"),
+        ("idx_production_records_model", "model"),
+        ("idx_production_records_customer_id", "customer_id"),
+        ("idx_production_records_batch_number", "batch_number"),
+        ("idx_production_records_operator_id", "operator_id"),
+    ):
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS {index_name} ON production_records ({column})"
+        )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_summary_unique_key
+        ON daily_production_summary (
+            production_date,
+            machine_id,
+            table_no,
+            model,
+            COALESCE(customer_id, -1),
+            COALESCE(batch_number, ''),
+            COALESCE(operator_id, -1)
+        )
+        """
+    )
+    for index_name, column in (
+        ("idx_daily_summary_production_date", "production_date"),
+        ("idx_daily_summary_table_no", "table_no"),
+        ("idx_daily_summary_model", "model"),
+        ("idx_daily_summary_customer_id", "customer_id"),
+        ("idx_daily_summary_batch_number", "batch_number"),
+        ("idx_daily_summary_operator_id", "operator_id"),
+    ):
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS {index_name} ON daily_production_summary ({column})"
+        )
+
+
+def _production_metadata_from_response(
+    odoo_response: str,
+    mqtt_message_id: int,
+) -> dict[str, object | None]:
+    metadata: dict[str, object | None] = {
+        "customer_id": None,
+        "customer_name": None,
+        "operator_id": None,
+        "operator_name": None,
+        "number_of_operators": None,
+        "batch_number": None,
+    }
+    try:
+        parsed = json.loads(odoo_response)
+    except json.JSONDecodeError as exc:
+        LOGGER.warning(
+            "Unable to parse Odoo response metadata for mqtt_message_id=%s: %s",
+            mqtt_message_id,
+            exc,
+        )
+        return metadata
+
+    result = parsed.get("result") if isinstance(parsed, dict) else None
+    if not isinstance(result, dict):
+        LOGGER.warning(
+            "Odoo response metadata missing result object for mqtt_message_id=%s",
+            mqtt_message_id,
+        )
+        return metadata
+
+    metadata["customer_id"] = _metadata_int(result.get("customer_id"), "customer_id", mqtt_message_id)
+    metadata["customer_name"] = _metadata_str(result.get("customer_name"), "customer_name", mqtt_message_id)
+    metadata["operator_id"] = _metadata_int(result.get("operator_id"), "operator_id", mqtt_message_id)
+    metadata["operator_name"] = _metadata_str(result.get("operator_name"), "operator_name", mqtt_message_id)
+    metadata["number_of_operators"] = _metadata_int(
+        result.get("number_of_operators"),
+        "number_of_operators",
+        mqtt_message_id,
+    )
+    metadata["batch_number"] = _metadata_str(result.get("batch_number"), "batch_number", mqtt_message_id)
+    return metadata
+
+
+def _metadata_int(value: object, field_name: str, mqtt_message_id: int) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    LOGGER.warning(
+        "Ignoring invalid Odoo metadata field=%s value=%r mqtt_message_id=%s",
+        field_name,
+        value,
+        mqtt_message_id,
+    )
+    return None
+
+
+def _metadata_str(value: object, field_name: str, mqtt_message_id: int) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    LOGGER.warning(
+        "Ignoring invalid Odoo metadata field=%s value=%r mqtt_message_id=%s",
+        field_name,
+        value,
+        mqtt_message_id,
+    )
+    return None
+
+
+def _upsert_production_record_and_summary(
+    *,
+    connection: sqlite3.Connection,
+    source: sqlite3.Row,
+    completed_at: str,
+    machine_id: str,
+    ack: str,
+    customer_id: int | None,
+    customer_name: str | None,
+    operator_id: int | None,
+    operator_name: str | None,
+    number_of_operators: int | None,
+    batch_number: str | None,
+    raw_odoo_response: str,
+) -> bool:
+    production_date = _production_date(completed_at)
+    now_text = _format_timestamp(datetime.now(timezone.utc))
+    source_id = int(source["id"])
+    existing = connection.execute(
+        """
+        SELECT summary_applied
+        FROM production_records
+        WHERE mqtt_message_id = ?
+        LIMIT 1
+        """,
+        (source_id,),
+    ).fetchone()
+    summary_already_applied = bool(existing and int(existing["summary_applied"] or 0))
+
+    connection.execute(
+        """
+        INSERT INTO production_records (
+            mqtt_message_id,
+            completed_at,
+            production_date,
+            message_type,
+            machine_id,
+            table_no,
+            model,
+            serial,
+            ack,
+            customer_id,
+            customer_name,
+            operator_id,
+            operator_name,
+            number_of_operators,
+            batch_number,
+            status,
+            raw_odoo_response,
+            created_at,
+            summary_applied
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(mqtt_message_id) DO UPDATE SET
+            completed_at = excluded.completed_at,
+            production_date = excluded.production_date,
+            message_type = excluded.message_type,
+            machine_id = excluded.machine_id,
+            table_no = excluded.table_no,
+            model = excluded.model,
+            serial = excluded.serial,
+            ack = excluded.ack,
+            customer_id = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            operator_id = excluded.operator_id,
+            operator_name = excluded.operator_name,
+            number_of_operators = excluded.number_of_operators,
+            batch_number = excluded.batch_number,
+            status = excluded.status,
+            raw_odoo_response = excluded.raw_odoo_response
+        """,
+        (
+            source_id,
+            completed_at,
+            production_date,
+            str(source["message_type"]),
+            machine_id,
+            str(source["table_no"]),
+            str(source["model"]),
+            str(source["serial"]),
+            ack,
+            customer_id,
+            customer_name,
+            operator_id,
+            operator_name,
+            number_of_operators,
+            batch_number,
+            "COMPLETED",
+            raw_odoo_response,
+            now_text,
+            1 if summary_already_applied else 0,
+        ),
+    )
+
+    if summary_already_applied:
+        return False
+
+    _increment_daily_summary(
+        connection=connection,
+        production_date=production_date,
+        machine_id=machine_id,
+        table_no=str(source["table_no"]),
+        model=str(source["model"]),
+        customer_id=customer_id,
+        customer_name=customer_name,
+        batch_number=batch_number,
+        operator_id=operator_id,
+        operator_name=operator_name,
+        number_of_operators=number_of_operators,
+        ack=ack,
+        completed_at=completed_at,
+        now_text=now_text,
+    )
+    connection.execute(
+        """
+        UPDATE production_records
+        SET summary_applied = 1
+        WHERE mqtt_message_id = ?
+        """,
+        (source_id,),
+    )
+    return True
+
+
+def _production_summary_applied(
+    connection: sqlite3.Connection,
+    mqtt_message_id: int,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT summary_applied
+        FROM production_records
+        WHERE mqtt_message_id = ?
+        LIMIT 1
+        """,
+        (mqtt_message_id,),
+    ).fetchone()
+    return bool(row and int(row["summary_applied"] or 0))
+
+
+def _increment_daily_summary(
+    *,
+    connection: sqlite3.Connection,
+    production_date: str,
+    machine_id: str,
+    table_no: str,
+    model: str,
+    customer_id: int | None,
+    customer_name: str | None,
+    batch_number: str | None,
+    operator_id: int | None,
+    operator_name: str | None,
+    number_of_operators: int | None,
+    ack: str,
+    completed_at: str,
+    now_text: str,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT id, first_ack, last_ack, first_completed_at, last_completed_at
+        FROM daily_production_summary
+        WHERE production_date = ?
+          AND machine_id = ?
+          AND table_no = ?
+          AND model = ?
+          AND COALESCE(customer_id, ?) = ?
+          AND COALESCE(batch_number, ?) = ?
+          AND COALESCE(operator_id, ?) = ?
+        LIMIT 1
+        """,
+        (
+            production_date,
+            machine_id,
+            table_no,
+            model,
+            SUMMARY_INT_SENTINEL,
+            customer_id if customer_id is not None else SUMMARY_INT_SENTINEL,
+            SUMMARY_TEXT_SENTINEL,
+            batch_number if batch_number is not None else SUMMARY_TEXT_SENTINEL,
+            SUMMARY_INT_SENTINEL,
+            operator_id if operator_id is not None else SUMMARY_INT_SENTINEL,
+        ),
+    ).fetchone()
+
+    if row is None:
+        connection.execute(
+            """
+            INSERT INTO daily_production_summary (
+                production_date,
+                machine_id,
+                table_no,
+                model,
+                customer_id,
+                customer_name,
+                batch_number,
+                operator_id,
+                operator_name,
+                number_of_operators,
+                production_count,
+                first_ack,
+                last_ack,
+                first_completed_at,
+                last_completed_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                production_date,
+                machine_id,
+                table_no,
+                model,
+                customer_id,
+                customer_name,
+                batch_number,
+                operator_id,
+                operator_name,
+                number_of_operators,
+                1,
+                ack,
+                ack,
+                completed_at,
+                completed_at,
+                now_text,
+                now_text,
+            ),
+        )
+        return
+
+    summary_id = int(row["id"])
+    first_ack = row["first_ack"]
+    last_ack = row["last_ack"]
+    first_completed_at = str(row["first_completed_at"])
+    last_completed_at = str(row["last_completed_at"])
+    new_first_ack = ack if completed_at < first_completed_at else first_ack
+    new_first_completed_at = (
+        completed_at if completed_at < first_completed_at else first_completed_at
+    )
+    new_last_ack = ack if completed_at >= last_completed_at else last_ack
+    new_last_completed_at = (
+        completed_at if completed_at >= last_completed_at else last_completed_at
+    )
+
+    connection.execute(
+        """
+        UPDATE daily_production_summary
+        SET production_count = production_count + 1,
+            first_ack = ?,
+            last_ack = ?,
+            first_completed_at = ?,
+            last_completed_at = ?,
+            customer_name = COALESCE(?, customer_name),
+            operator_name = COALESCE(?, operator_name),
+            number_of_operators = COALESCE(?, number_of_operators),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            new_first_ack,
+            new_last_ack,
+            new_first_completed_at,
+            new_last_completed_at,
+            customer_name,
+            operator_name,
+            number_of_operators,
+            now_text,
+            summary_id,
+        ),
+    )
+
+
+def _production_date(completed_at: str) -> str:
+    parsed = _parse_timestamp(completed_at)
+    if parsed is None:
+        raise ValueError("completed_at is required")
+    return parsed.date().isoformat()
+
+
+def _dashboard_filters(
+    *,
+    date_column: str,
+    date_from: str | None,
+    date_to: str | None,
+    table_no: str | None,
+    model: str | None,
+    customer_id: int | None,
+    batch_number: str | None,
+    operator_id: int | None,
+) -> tuple[str, tuple[object, ...]]:
+    clauses: list[str] = []
+    parameters: list[object] = []
+    if date_from:
+        clauses.append(f"{date_column} >= ?")
+        parameters.append(date_from)
+    if date_to:
+        clauses.append(f"{date_column} <= ?")
+        parameters.append(date_to)
+    for column, value in (
+        ("table_no", table_no),
+        ("model", model),
+        ("customer_id", customer_id),
+        ("batch_number", batch_number),
+        ("operator_id", operator_id),
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            parameters.append(value)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    return where, tuple(parameters)
+
+
+def _bounded_limit(value: int, *, default: int = 100, maximum: int = 500) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, 1), maximum)
 
 
 def _get_saved_message_by_hash(
@@ -975,33 +1939,35 @@ def _update_api_command_result(
             raise ValueError(f"API command request_id not found: {request_id}")
 
 
-def _record_columns_sql() -> str:
-    return """
-        id,
-        received_at,
-        topic,
-        message_type,
-        table_no,
-        model,
-        serial,
-        raw_payload,
-        message_hash,
-        status,
-        retry_count,
-        processed_at,
-        last_error,
-        odoo_response,
-        last_attempt_at,
-        completed_at,
-        ack,
-        customer_id,
-        customer_name,
-        operator_id,
-        operator_name,
-        batch_number,
-        ack_replay_count,
-        last_ack_replayed_at
-    """
+def _record_columns_sql(table_alias: str | None = None) -> str:
+    columns = (
+        "id",
+        "received_at",
+        "topic",
+        "message_type",
+        "table_no",
+        "model",
+        "serial",
+        "raw_payload",
+        "message_hash",
+        "status",
+        "retry_count",
+        "processed_at",
+        "last_error",
+        "odoo_response",
+        "last_attempt_at",
+        "completed_at",
+        "ack",
+        "customer_id",
+        "customer_name",
+        "operator_id",
+        "operator_name",
+        "batch_number",
+        "ack_replay_count",
+        "last_ack_replayed_at",
+    )
+    prefix = f"{table_alias}." if table_alias else ""
+    return ",\n        ".join(f"{prefix}{column}" for column in columns)
 
 
 def _format_timestamp(value: datetime) -> str:

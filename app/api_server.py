@@ -26,12 +26,14 @@ class BebApiServer:
         database_path: str | Path,
         odoo_worker: Any | None = None,
         readiness_monitor: Any | None = None,
+        sqlite_lifecycle: Any | None = None,
     ) -> None:
         self._config = config
         self._mqtt_client = mqtt_client
         self._database_path = database_path
         self._odoo_worker = odoo_worker
         self._readiness_monitor = readiness_monitor
+        self._sqlite_lifecycle = sqlite_lifecycle
         self._thread: threading.Thread | None = None
         self._server: uvicorn.Server | None = None
         self._lock = threading.Lock()
@@ -53,6 +55,7 @@ class BebApiServer:
                 self._database_path,
                 self._odoo_worker,
                 self._readiness_monitor,
+                self._sqlite_lifecycle,
             )
             uvicorn_config = uvicorn.Config(
                 app,

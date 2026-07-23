@@ -198,6 +198,44 @@ last_error TEXT
 
 API command statuses are `RECEIVED`, `PUBLISHED`, `FAILED`, `DUPLICATE`, and `REJECTED`. The audit table is created automatically and does not alter or recreate `mqtt_messages`.
 
+### SQLite Production Summaries
+
+BEB V1 keeps the existing raw queue tables as the source of operational truth and adds dashboard-ready production tables beside them. The raw `mqtt_messages` and `api_commands` tables continue to support queue processing, retries, duplicate protection, Odoo response storage, and API audit history. They are retained for the configured raw retention window.
+
+`production_records` stores recent ACK-level production history for traceability and dashboard recent-activity views. It is created from successful completed MQTT transactions only, preserves the full stored Odoo response in `raw_odoo_response`, and is uniquely keyed by `mqtt_message_id` so retries, duplicate deliveries, process restarts, or ACK replays cannot create multiple production rows for the same source queue row.
+
+`daily_production_summary` stores permanent production counts. It is never removed by raw cleanup. Weekly, monthly, and yearly totals are derived from this daily table with SQL date grouping; BEB does not maintain separate weekly, monthly, or yearly tables.
+
+Daily summary aggregation key:
+
+```text
+production_date
+machine_id
+table_no
+model
+customer_id
+batch_number
+operator_id
+```
+
+SQLite treats `NULL` values as distinct in unique indexes, so BEB uses a unique expression index with stable sentinel values for nullable `customer_id`, `batch_number`, and `operator_id`. This preserves one summary row per logical dashboard filter combination even when optional metadata is absent.
+
+On successful Odoo completion, BEB stores the full Odoo response in `mqtt_messages.odoo_response`, marks the row `COMPLETED`, upserts exactly one `production_records` row, increments `daily_production_summary`, marks `production_records.summary_applied=1`, and then continues the existing ACK publication path. Invalid or missing optional Odoo metadata is logged and ignored for summary dimensions; it does not block completion or ACK handling.
+
+Startup reconciliation scans a bounded number of completed, ACK-bearing rows that are not yet summarized. It rebuilds production records and daily summaries idempotently from stored SQLite data only. It never contacts Odoo, never republishes ACKs, and never changes completed queue status.
+
+Raw cleanup is configurable and disabled from deleting anything unsafe. By default, records older than 30 days may be removed only when they are old and summarized or otherwise terminal-safe:
+
+- `mqtt_messages`: old `COMPLETED` rows with a summarized `production_records` row.
+- `production_records`: old rows with `summary_applied=1`.
+- `api_commands`: old terminal `PUBLISHED`, `FAILED`, `REJECTED`, or `DUPLICATE` audit rows.
+
+Cleanup never deletes `NEW`, `PROCESSING`, retryable queue rows, unsummarized production records, rows inside retention, or `daily_production_summary`. Cleanup runs in bounded batches at startup and then once per configured interval; it is not a continuous one-second loop. Zero-delete cycles are DEBUG-only, while deletions and errors are logged at operational levels.
+
+`VACUUM` is disabled by default. If enabled later, treat it as maintenance: it rewrites the SQLite database file and should run only after a verified backup and during an approved service window.
+
+Back up the SQLite volume before first production migration, before changing retention policy, before enabling VACUUM, and before rollback. Schema migration uses `CREATE TABLE IF NOT EXISTS` and additive indexes, so existing production data is upgraded in place without table recreation.
+
 ## Status State
 
 ```text
@@ -248,7 +286,7 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
-The health response preserves the existing fields and also reports worker and readiness state. Readiness fields are:
+The health response preserves the existing fields and also reports worker, readiness, and SQLite lifecycle state. Readiness fields are:
 
 ```text
 beb_ready_enabled
@@ -263,7 +301,37 @@ beb_ready_disconnect_elapsed_seconds
 beb_ready_recovery_elapsed_seconds
 ```
 
+SQLite lifecycle fields are:
+
+```text
+database_health
+sqlite_database_size_bytes
+sqlite_page_count
+sqlite_page_size
+sqlite_freelist_count
+production_records_count
+daily_summary_count
+oldest_raw_record_at
+retention_days
+cleanup_enabled
+last_cleanup_at
+last_cleanup_deleted_rows
+last_cleanup_error
+```
+
+These SQLite lifecycle metrics are cached briefly in process to avoid running table counts and size checks on every frequent health request.
+
 When readiness is enabled and the confirmed state is not `READY`, `/health` reports a degraded status. Readiness checks do not stop the queue worker, do not submit print/inventory business messages, and do not alter ACK or timeout handling.
+
+Dashboard-ready read-only API routes:
+
+```text
+GET /api/v1/dashboard/production/recent
+GET /api/v1/dashboard/production/daily
+GET /api/v1/dashboard/production/summary
+```
+
+These routes use the same HTTP Basic API authentication as the command route, return bounded results, and expose only dashboard-safe production fields. Supported filters are `date_from`, `date_to`, `table_no`, `model`, `customer_id`, `batch_number`, `operator_id`, and `limit` where applicable. Dashboard clients should use these APIs instead of reading the SQLite file directly.
 
 Publish command:
 
@@ -331,6 +399,13 @@ BEB_READY_AUTH_REVALIDATE_SECONDS=300
 BEB_READY_DISCONNECT_DELAY_SECONDS=5
 BEB_READY_RECOVERY_DELAY_SECONDS=10
 BEB_READY_TOPIC=MQTT/ODOO_TO_PLC/topic
+BEB_MACHINE_ID=BLACKBEAR_PYTHON_BRIDGE_DEV
+SQLITE_RAW_RETENTION_DAYS=30
+SQLITE_CLEANUP_ENABLED=true
+SQLITE_CLEANUP_INTERVAL_HOURS=24
+SQLITE_CLEANUP_BATCH_SIZE=1000
+SQLITE_VACUUM_ENABLED=false
+SQLITE_RECONCILE_BATCH_SIZE=100
 ```
 
 Production default logging is `LOG_LEVEL=INFO`. Routine successful readiness checks, cached Odoo authentication messages, zero-row stale watchdog passes, and other repetitive internal polling diagnostics are DEBUG-only. Use `LOG_LEVEL=DEBUG` during BBA testing or troubleshooting when those details are needed. Production transaction traceability remains at INFO or above for MQTT receives, Odoo API commands, command publishes, queue processing, retries, completions, readiness transitions, and BR publication.
@@ -392,6 +467,13 @@ BEB_READY_AUTH_REVALIDATE_SECONDS=300
 BEB_READY_DISCONNECT_DELAY_SECONDS=5
 BEB_READY_RECOVERY_DELAY_SECONDS=10
 BEB_READY_TOPIC=MQTT/ODOO_TO_PLC/topic
+BEB_MACHINE_ID=BEB_BBW_TABLE1
+SQLITE_RAW_RETENTION_DAYS=30
+SQLITE_CLEANUP_ENABLED=true
+SQLITE_CLEANUP_INTERVAL_HOURS=24
+SQLITE_CLEANUP_BATCH_SIZE=1000
+SQLITE_VACUUM_ENABLED=false
+SQLITE_RECONCILE_BATCH_SIZE=100
 ```
 
 ## Windows Development
@@ -558,6 +640,9 @@ docker compose ps
 
 # health
 curl http://127.0.0.1:8000/health
+
+# database size and lifecycle metrics
+curl http://127.0.0.1:8000/health | python3 -m json.tool
 
 # live BEB logs
 docker compose logs -f beb

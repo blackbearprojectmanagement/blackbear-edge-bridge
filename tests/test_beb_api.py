@@ -18,8 +18,10 @@ from app.api_server import BebApiServer
 from app.command_parser import CommandValidationError, validate_plc_command
 from app.config import AppConfig
 from app.database import (
+    claim_pending_messages,
     get_api_command_by_idempotency_key,
     initialize_api_commands_table,
+    mark_completed,
     save_message,
     update_status,
 )
@@ -218,6 +220,10 @@ class TestBebApi(ApiTestCase):
         self.assertIn("beb_ready_enabled", response.json())
         self.assertIn("beb_ready_state", response.json())
         self.assertIn("beb_ready_check_timeout_seconds", response.json())
+        self.assertIn("sqlite_database_size_bytes", response.json())
+        self.assertIn("production_records_count", response.json())
+        self.assertIn("daily_summary_count", response.json())
+        self.assertIn("retention_days", response.json())
 
     def test_health_degrades_when_worker_unhealthy(self) -> None:
         client, _ = self.make_client(odoo_worker=FakeWorker(healthy=False))
@@ -489,6 +495,57 @@ class TestBebApi(ApiTestCase):
                 ).fetchone()
 
         self.assertIsNotNone(row)
+
+    def test_dashboard_read_endpoints_are_authenticated_and_bounded(self) -> None:
+        saved = save_message(
+            topic="MQTT/PLC_TO_ODOO/topic",
+            raw_payload='{"MN":"106-020C012P001 7777T01"}',
+            message_type="MN",
+            table_no="T01",
+            model="106-020C012P001",
+            serial="7777",
+            database_path=self.database_path,
+        )
+        claim_pending_messages(10, 10, self.database_path)
+        mark_completed(
+            saved.id,
+            json.dumps(
+                {
+                    "success": True,
+                    "result": {
+                        "ACK": "7777",
+                        "customer_id": 21,
+                        "customer_name": "MAGNA",
+                    },
+                }
+            ),
+            "2026-07-21T10:00:00+00:00",
+            self.database_path,
+            ack="7777",
+        )
+        client, _ = self.make_client()
+
+        unauthenticated = client.get("/api/v1/dashboard/production/recent")
+        recent = client.get(
+            "/api/v1/dashboard/production/recent?limit=10",
+            auth=("odoo", "password"),
+        )
+        daily = client.get(
+            "/api/v1/dashboard/production/daily?limit=10",
+            auth=("odoo", "password"),
+        )
+        summary = client.get(
+            "/api/v1/dashboard/production/summary",
+            auth=("odoo", "password"),
+        )
+
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(recent.status_code, 200)
+        self.assertEqual(daily.status_code, 200)
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(recent.json()["items"][0]["ack"], "7777")
+        self.assertEqual(daily.json()["items"][0]["production_count"], 1)
+        self.assertEqual(summary.json()["production_count"], 1)
 
 
 class TestMqttCommandPublishing(unittest.TestCase):

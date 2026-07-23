@@ -13,6 +13,7 @@ from app.mqtt_client import BEBMqttClient
 from app.odoo_client import OdooXmlRpcClient
 from app.queue_worker import OdooQueueWorker
 from app.readiness import ReadinessMonitor
+from app.sqlite_lifecycle import SQLiteLifecycleManager
 
 
 def configure_logging(config: AppConfig) -> None:
@@ -50,6 +51,7 @@ def create_odoo_worker(
         stale_processing_timeout=config.odoo_stale_processing_seconds,
         ack_publisher=ack_publisher,
         submission_timeout=config.odoo_timeout,
+        machine_id=config.machine_id,
     )
     return worker, odoo_client
 
@@ -101,6 +103,17 @@ def main() -> None:
     configure_logging(config)
     initialize_database(config.database_path)
     initialize_api_commands_table(config.database_path)
+    sqlite_lifecycle = SQLiteLifecycleManager(
+        database_path=config.database_path,
+        machine_id=config.machine_id,
+        retention_days=config.sqlite_raw_retention_days,
+        cleanup_enabled=config.sqlite_cleanup_enabled,
+        cleanup_interval_hours=config.sqlite_cleanup_interval_hours,
+        cleanup_batch_size=config.sqlite_cleanup_batch_size,
+        vacuum_enabled=config.sqlite_vacuum_enabled,
+        reconcile_batch_size=config.sqlite_reconcile_batch_size,
+    )
+    sqlite_lifecycle.start()
 
     client = BEBMqttClient(config)
     worker_bundle = create_odoo_worker(config, ack_publisher=client.publish_ack)
@@ -118,6 +131,7 @@ def main() -> None:
         config.database_path,
         worker,
         readiness_monitor,
+        sqlite_lifecycle,
     )
 
     try:
@@ -130,6 +144,7 @@ def main() -> None:
     finally:
         readiness_monitor.stop()
         api_server.stop()
+        sqlite_lifecycle.stop()
         if worker is not None:
             worker.stop()
         client.shutdown()

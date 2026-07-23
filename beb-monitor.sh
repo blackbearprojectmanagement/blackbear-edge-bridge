@@ -94,6 +94,8 @@ except Exception as exc:
 
 connection.row_factory = sqlite3.Row
 
+print(f"SQLite file size bytes: {db_path.stat().st_size}")
+
 def table_exists(name: str) -> bool:
     row = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
@@ -126,6 +128,36 @@ try:
             print(f"  {row['status']}: {row['count']}")
     else:
         print("  api_commands table missing")
+
+    print("\nproduction_records count:")
+    if table_exists("production_records"):
+        row = connection.execute("SELECT COUNT(*) FROM production_records").fetchone()
+        print(f"  {row[0]}")
+    else:
+        print("  production_records table missing")
+
+    print("\ndaily_production_summary count:")
+    if table_exists("daily_production_summary"):
+        row = connection.execute("SELECT COUNT(*) FROM daily_production_summary").fetchone()
+        print(f"  {row[0]}")
+    else:
+        print("  daily_production_summary table missing")
+
+    print("\nOldest raw record:")
+    rows = []
+    if table_exists("mqtt_messages"):
+        rows.append("SELECT received_at AS value FROM mqtt_messages")
+    if table_exists("api_commands"):
+        rows.append("SELECT received_at AS value FROM api_commands")
+    if table_exists("production_records"):
+        rows.append("SELECT completed_at AS value FROM production_records")
+    if rows:
+        row = connection.execute(
+            "SELECT MIN(value) FROM (" + " UNION ALL ".join(rows) + ") WHERE value IS NOT NULL"
+        ).fetchone()
+        print(f"  {row[0] or 'unavailable'}")
+    else:
+        print("  unavailable")
 
     print("\nLatest 10 mqtt_messages:")
     if table_exists("mqtt_messages"):
@@ -191,6 +223,36 @@ fi
 
 section "Application Timestamps In IST"
 print_health_time_summary
+
+section "SQLite Lifecycle"
+if [ -n "${HEALTH_JSON:-}" ] && command -v python3 >/dev/null 2>&1; then
+  HEALTH_JSON="$HEALTH_JSON" python3 - <<'PY'
+import json
+import os
+
+try:
+    payload = json.loads(os.environ["HEALTH_JSON"])
+except Exception as exc:
+    print(f"Malformed health JSON; lifecycle summary skipped: {exc}")
+    raise SystemExit(0)
+
+fields = [
+    ("sqlite_database_size_bytes", "sqlite_database_size_bytes"),
+    ("production_records_count", "production_records_count"),
+    ("daily_summary_count", "daily_summary_count"),
+    ("oldest_raw_record_at", "oldest_raw_record_at"),
+    ("retention_days", "retention_days"),
+    ("cleanup_enabled", "cleanup_enabled"),
+    ("last_cleanup_at", "last_cleanup_at"),
+    ("last_cleanup_deleted_rows", "last_cleanup_deleted_rows"),
+    ("last_cleanup_error", "last_cleanup_error"),
+]
+for label, key in fields:
+    print(f"{label}: {payload.get(key, 'unavailable')}")
+PY
+else
+  printf 'Health JSON or python3 unavailable; lifecycle summary skipped.\n'
+fi
 
 section "Docker Resources"
 run_compose ps >/dev/null 2>&1

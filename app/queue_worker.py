@@ -153,6 +153,7 @@ class OdooQueueWorker:
         ack_publisher: Callable[[str], bool] | None = None,
         submission_timeout: int | None = None,
         watchdog_interval: int = STALE_RECOVERY_INTERVAL_SECONDS,
+        machine_id: str = "BEB",
     ) -> None:
         self._database_path = Path(database_path)
         self._odoo_client = odoo_client
@@ -165,6 +166,7 @@ class OdooQueueWorker:
             getattr(odoo_client, "timeout", 15)
         )
         self._watchdog_interval = watchdog_interval
+        self._machine_id = machine_id
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
@@ -422,6 +424,7 @@ class OdooQueueWorker:
             completed_at,
             self._database_path,
             ack=ack,
+            machine_id=self._machine_id,
             **metadata,
         )
         LOGGER.info("\n%s", format_success_log(record, response_text))
@@ -703,6 +706,7 @@ def extract_dashboard_metadata(response: object) -> dict[str, object | None]:
             "customer_name": None,
             "operator_id": None,
             "operator_name": None,
+            "number_of_operators": None,
             "batch_number": None,
         }
 
@@ -711,6 +715,7 @@ def extract_dashboard_metadata(response: object) -> dict[str, object | None]:
         "customer_name": _optional_str(result.get("customer_name")),
         "operator_id": _optional_int(result.get("operator_id")),
         "operator_name": _optional_str(result.get("operator_name")),
+        "number_of_operators": _optional_int(result.get("number_of_operators")),
         "batch_number": _optional_str(result.get("batch_number")),
     }
 

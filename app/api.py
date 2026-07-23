@@ -6,12 +6,14 @@ import json
 import logging
 import secrets
 import sqlite3
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -21,11 +23,15 @@ from app.database import (
     ApiCommandRecord,
     create_api_command_record,
     get_api_command_by_idempotency_key,
+    get_database_status,
     get_queue_counts,
     initialize_api_commands_table,
     mark_api_command_failed,
     mark_api_command_published,
     mark_api_command_rejected,
+    query_daily_production_summary,
+    query_production_summary_totals,
+    query_recent_production_records,
     save_api_response,
 )
 from app.mqtt_client import PLC_JSON_SEPARATORS, PublishResult
@@ -33,6 +39,7 @@ from app.mqtt_client import PLC_JSON_SEPARATORS, PublishResult
 
 LOGGER = logging.getLogger(__name__)
 SECURITY = HTTPBasic(auto_error=False)
+DATABASE_HEALTH_CACHE_SECONDS = 30.0
 
 
 def create_api_app(
@@ -41,10 +48,16 @@ def create_api_app(
     database_path: str | Path,
     odoo_worker: Any | None = None,
     readiness_monitor: Any | None = None,
+    sqlite_lifecycle: Any | None = None,
 ) -> FastAPI:
     """Create the BEB FastAPI application."""
     initialize_api_commands_table(database_path)
     app = FastAPI(title="BlackBear Edge Bridge API")
+    database_health_cache: dict[str, object] = {
+        "expires_at": 0.0,
+        "value": None,
+    }
+    database_health_lock = threading.Lock()
 
     def authenticate(
         credentials: HTTPBasicCredentials | None = Depends(SECURITY),
@@ -69,6 +82,13 @@ def create_api_app(
     def health() -> dict[str, object]:
         worker_health = _worker_health(config, odoo_worker, database_path)
         readiness_health = _readiness_health(config, readiness_monitor)
+        database_health = _database_health(
+            config,
+            sqlite_lifecycle,
+            database_path,
+            database_health_cache,
+            database_health_lock,
+        )
         status = "ok"
         if config.odoo_enabled and not worker_health["worker_healthy"]:
             status = "degraded"
@@ -83,7 +103,85 @@ def create_api_app(
             "api_enabled": config.beb_api_enabled,
             **worker_health,
             **readiness_health,
+            **database_health,
         }
+
+    @app.get("/api/v1/dashboard/production/recent")
+    def dashboard_recent(
+        username: str = Depends(authenticate),
+        date_from: str | None = None,
+        date_to: str | None = None,
+        table_no: str | None = None,
+        model: str | None = None,
+        customer_id: int | None = None,
+        batch_number: str | None = None,
+        operator_id: int | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, object]:
+        del username
+        return {
+            "items": query_recent_production_records(
+                database_path,
+                date_from=date_from,
+                date_to=date_to,
+                table_no=table_no,
+                model=model,
+                customer_id=customer_id,
+                batch_number=batch_number,
+                operator_id=operator_id,
+                limit=limit,
+            )
+        }
+
+    @app.get("/api/v1/dashboard/production/daily")
+    def dashboard_daily(
+        username: str = Depends(authenticate),
+        date_from: str | None = None,
+        date_to: str | None = None,
+        table_no: str | None = None,
+        model: str | None = None,
+        customer_id: int | None = None,
+        batch_number: str | None = None,
+        operator_id: int | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, object]:
+        del username
+        return {
+            "items": query_daily_production_summary(
+                database_path,
+                date_from=date_from,
+                date_to=date_to,
+                table_no=table_no,
+                model=model,
+                customer_id=customer_id,
+                batch_number=batch_number,
+                operator_id=operator_id,
+                limit=limit,
+            )
+        }
+
+    @app.get("/api/v1/dashboard/production/summary")
+    def dashboard_summary(
+        username: str = Depends(authenticate),
+        date_from: str | None = None,
+        date_to: str | None = None,
+        table_no: str | None = None,
+        model: str | None = None,
+        customer_id: int | None = None,
+        batch_number: str | None = None,
+        operator_id: int | None = None,
+    ) -> dict[str, object]:
+        del username
+        return query_production_summary_totals(
+            database_path,
+            date_from=date_from,
+            date_to=date_to,
+            table_no=table_no,
+            model=model,
+            customer_id=customer_id,
+            batch_number=batch_number,
+            operator_id=operator_id,
+        )
 
     @app.post("/api/v1/plc/command")
     async def plc_command(
@@ -353,6 +451,45 @@ def _readiness_health(
         "beb_ready_disconnect_elapsed_seconds": None,
         "beb_ready_recovery_elapsed_seconds": None,
     }
+
+
+def _database_health(
+    config: AppConfig,
+    sqlite_lifecycle: Any | None,
+    database_path: str | Path,
+    cache: dict[str, object],
+    cache_lock: threading.Lock,
+) -> dict[str, object]:
+    now = time.monotonic()
+    with cache_lock:
+        cached_value = cache.get("value")
+        expires_at = float(cache.get("expires_at", 0.0) or 0.0)
+        if isinstance(cached_value, dict) and expires_at > now:
+            return dict(cached_value)
+
+    last_cleanup_at = None
+    last_cleanup_deleted_rows = None
+    last_cleanup_error = None
+    if sqlite_lifecycle is not None:
+        snapshot = getattr(sqlite_lifecycle, "snapshot", None)
+        if callable(snapshot):
+            value = snapshot()
+            last_cleanup_at = value.last_cleanup_at
+            last_cleanup_deleted_rows = value.last_cleanup_deleted_rows
+            last_cleanup_error = value.last_cleanup_error
+
+    value = get_database_status(
+        database_path,
+        retention_days=config.sqlite_raw_retention_days,
+        cleanup_enabled=config.sqlite_cleanup_enabled,
+        last_cleanup_at=last_cleanup_at,
+        last_cleanup_deleted_rows=last_cleanup_deleted_rows,
+        last_cleanup_error=last_cleanup_error,
+    )
+    with cache_lock:
+        cache["value"] = dict(value)
+        cache["expires_at"] = time.monotonic() + DATABASE_HEALTH_CACHE_SECONDS
+    return value
 
 
 def _get_duplicate_response(
