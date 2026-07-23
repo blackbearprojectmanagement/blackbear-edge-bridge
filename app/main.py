@@ -9,6 +9,7 @@ from typing import Callable
 from app.api_server import BebApiServer
 from app.config import AppConfig, load_config
 from app.database import initialize_api_commands_table, initialize_database
+from app.logging_config import configure_ist_logging
 from app.mqtt_client import BEBMqttClient
 from app.odoo_client import OdooXmlRpcClient
 from app.queue_worker import OdooQueueWorker
@@ -17,10 +18,7 @@ from app.sqlite_lifecycle import SQLiteLifecycleManager
 
 
 def configure_logging(config: AppConfig) -> None:
-    logging.basicConfig(
-        level=getattr(logging, config.log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
+    configure_ist_logging(config.log_level)
 
 
 def create_odoo_worker(
