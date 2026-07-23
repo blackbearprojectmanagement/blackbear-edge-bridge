@@ -88,7 +88,9 @@ def create_readiness_monitor(
         disconnect_delay_seconds=config.beb_ready_disconnect_delay_seconds,
         recovery_delay_seconds=config.beb_ready_recovery_delay_seconds,
         topic=config.beb_ready_topic,
-        readiness_check=readiness_odoo_client.check_readiness,
+        readiness_check=lambda: readiness_odoo_client.check_readiness(
+            config.beb_ready_auth_revalidate_seconds
+        ),
         publisher=mqtt_client.publish_readiness,
     )
     return monitor, readiness_odoo_client

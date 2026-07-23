@@ -6,6 +6,11 @@ services:
     image: blackbear-edge-bridge:local
     container_name: beb
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     depends_on:
       mosquitto:
         condition: service_healthy
@@ -39,6 +44,11 @@ services:
     image: eclipse-mosquitto:2.0
     container_name: beb-mosquitto
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "1883:1883"
     volumes:

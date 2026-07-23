@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import unittest
 import xmlrpc.client
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from app.odoo_client import (
@@ -170,6 +171,7 @@ class TestOdooXmlRpcClient(unittest.TestCase):
         self.client._common = common
         self.client._models = models
         self.client._uid = 7
+        self.client._last_authenticated_at = datetime.now(timezone.utc)
 
         self.client.close()
 
@@ -178,6 +180,7 @@ class TestOdooXmlRpcClient(unittest.TestCase):
         self.assertIsNone(self.client._common)
         self.assertIsNone(self.client._models)
         self.assertIsNone(self.client._uid)
+        self.assertIsNone(self.client._last_authenticated_at)
 
     def test_close_is_idempotent(self) -> None:
         self.client._common = MagicMock()
@@ -243,6 +246,49 @@ class TestOdooXmlRpcClient(unittest.TestCase):
             "secret",
             {},
         )
+
+    @patch("app.odoo_client.xmlrpc.client.ServerProxy")
+    def test_readiness_check_reuses_cached_authentication_when_healthy(self, server_proxy) -> None:
+        common = MagicMock()
+        common.version.return_value = {"server_version": "18.0"}
+        common.authenticate.return_value = 7
+        server_proxy.return_value = common
+
+        self.assertTrue(self.client.check_readiness(revalidate_after_seconds=300))
+        self.assertTrue(self.client.check_readiness(revalidate_after_seconds=300))
+
+        self.assertEqual(common.version.call_count, 2)
+        self.assertEqual(common.authenticate.call_count, 1)
+
+    @patch("app.odoo_client.xmlrpc.client.ServerProxy")
+    def test_readiness_check_reauthenticates_after_session_invalidation(self, server_proxy) -> None:
+        common = MagicMock()
+        common.version.return_value = {"server_version": "18.0"}
+        common.authenticate.side_effect = [7, 8]
+        server_proxy.return_value = common
+
+        self.assertTrue(self.client.check_readiness(revalidate_after_seconds=300))
+        self.client.invalidate_session()
+        self.assertTrue(self.client.check_readiness(revalidate_after_seconds=300))
+
+        self.assertEqual(common.authenticate.call_count, 2)
+        self.assertEqual(self.client._uid, 8)
+
+    @patch("app.odoo_client.xmlrpc.client.ServerProxy")
+    def test_readiness_check_reauthenticates_after_revalidation_interval(self, server_proxy) -> None:
+        common = MagicMock()
+        common.version.return_value = {"server_version": "18.0"}
+        common.authenticate.side_effect = [7, 8]
+        server_proxy.return_value = common
+
+        self.assertTrue(self.client.check_readiness(revalidate_after_seconds=300))
+        self.client._last_authenticated_at = datetime.now(timezone.utc) - timedelta(
+            seconds=301
+        )
+        self.assertTrue(self.client.check_readiness(revalidate_after_seconds=300))
+
+        self.assertEqual(common.authenticate.call_count, 2)
+        self.assertEqual(self.client._uid, 8)
 
     @patch("app.odoo_client.xmlrpc.client.ServerProxy")
     def test_readiness_check_resets_proxy_after_transport_failure(self, server_proxy) -> None:

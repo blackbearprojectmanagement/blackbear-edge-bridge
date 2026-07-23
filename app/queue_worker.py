@@ -454,7 +454,7 @@ class OdooQueueWorker:
                 sorted(excluded_ids),
             )
         else:
-            LOGGER.info("Stale PROCESSING watchdog recovered 0 row(s)")
+            LOGGER.debug("Stale PROCESSING watchdog recovered 0 row(s)")
         return recovered
 
     def _active_record_ids_protected_from_watchdog(

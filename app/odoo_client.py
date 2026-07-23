@@ -6,6 +6,7 @@ import logging
 import socket
 import ssl
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 import xmlrpc.client
 
@@ -53,6 +54,7 @@ class OdooXmlRpcClient:
         self._submit_method = submit_method
         self._timeout = timeout
         self._uid: int | None = None
+        self._last_authenticated_at: datetime | None = None
         self._common: xmlrpc.client.ServerProxy | None = None
         self._models: xmlrpc.client.ServerProxy | None = None
 
@@ -103,7 +105,8 @@ class OdooXmlRpcClient:
             raise OdooAuthenticationError("Odoo authentication failed: invalid UID")
 
         self._uid = uid
-        LOGGER.info("Authenticated with Odoo as user %s", self._username)
+        self._last_authenticated_at = datetime.now(timezone.utc)
+        LOGGER.debug("Authenticated with Odoo as user %s", self._username)
         return uid
 
     def submit_print_data(self, payload: dict[str, str]) -> object:
@@ -115,14 +118,15 @@ class OdooXmlRpcClient:
         except OdooAuthenticationError as exc:
             raise OdooSubmissionError(str(exc)) from exc
 
-    def check_readiness(self) -> bool:
+    def check_readiness(self, revalidate_after_seconds: int | float | None = 300) -> bool:
         """Verify Odoo XML-RPC and database authentication without business effects."""
         try:
             common = self._get_common_proxy()
             version = common.version()
             if not isinstance(version, dict):
                 return False
-            self.authenticate()
+            if self._authentication_revalidation_due(revalidate_after_seconds):
+                self.authenticate()
             return True
         except OdooAuthenticationError:
             raise
@@ -135,6 +139,7 @@ class OdooXmlRpcClient:
 
     def invalidate_session(self) -> None:
         self._uid = None
+        self._last_authenticated_at = None
 
     def reset_session(self) -> None:
         """Drop cached proxies and authentication state after unsafe transport errors."""
@@ -144,6 +149,19 @@ class OdooXmlRpcClient:
         self._common = None
         self._models = None
         self.invalidate_session()
+
+    def _authentication_revalidation_due(
+        self,
+        revalidate_after_seconds: int | float | None,
+    ) -> bool:
+        if not self.is_authenticated() or self._last_authenticated_at is None:
+            return True
+        if revalidate_after_seconds is None or revalidate_after_seconds <= 0:
+            return False
+
+        return datetime.now(timezone.utc) - self._last_authenticated_at >= timedelta(
+            seconds=float(revalidate_after_seconds)
+        )
 
     def _submit_print_data(
         self,

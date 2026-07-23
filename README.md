@@ -103,7 +103,7 @@ BEB can also publish its own Odoo-path readiness status to the PLC-bound topic c
 
 `{"BR":1}` means BEB has confirmed that the Odoo XML-RPC path is reachable and authenticating. `{"BR":0}` means BEB cannot currently confirm that path. This is an operational readiness signal for PLC logic such as M200; it is not a safety interlock. BEB publishes `BR` only on confirmed state changes, never as a continuous heartbeat.
 
-At startup the readiness state is unknown/not ready. BEB publishes `BR=1` only after 10 seconds of continuous successful Odoo checks. If the first check fails, BEB publishes `BR=0` once. From READY, failures must continue for 5 seconds before BEB publishes `BR=0`; from NOT_READY, successes must continue for 10 seconds before BEB publishes `BR=1`. Brief opposite results reset the active debounce timer. Each readiness check uses the short `BEB_READY_CHECK_TIMEOUT_SECONDS` timeout, default `3` seconds, for both `common.version()` and authentication. It does not inherit the production print/inventory `ODOO_TIMEOUT=90`.
+At startup the readiness state is unknown/not ready. BEB publishes `BR=1` only after 10 seconds of continuous successful Odoo checks. If the first check fails, BEB publishes `BR=0` once. From READY, failures must continue for 5 seconds before BEB publishes `BR=0`; from NOT_READY, successes must continue for 10 seconds before BEB publishes `BR=1`. Brief opposite results reset the active debounce timer. The readiness loop runs every `BEB_READY_CHECK_INTERVAL_SECONDS`, default `30` seconds. Each readiness check uses the short `BEB_READY_CHECK_TIMEOUT_SECONDS` timeout, default `3` seconds, and reuses a valid Odoo UID instead of authenticating on every healthy check. BEB re-authenticates when authentication is absent, invalidated after an authentication-related failure, or older than `BEB_READY_AUTH_REVALIDATE_SECONDS`, default `300` seconds. Readiness does not inherit the production print/inventory `ODOO_TIMEOUT=90`.
 
 Supported PLC payloads:
 
@@ -143,6 +143,8 @@ data/bridge.db
 ```
 
 The database is created automatically on first run. Existing data is preserved during migrations.
+
+SQLite timestamps are stored in UTC ISO-8601 form. Keep the application and API timestamp policy UTC; human-facing conversion, such as IST display, belongs in monitoring or dashboard layers.
 
 Table: `mqtt_messages`
 
@@ -323,12 +325,15 @@ BEB_API_IDEMPOTENCY_TTL_SECONDS=86400
 BEB_API_MAX_BODY_BYTES=16384
 BEB_API_LOG_REQUEST_BODY=true
 BEB_READY_ENABLED=true
-BEB_READY_CHECK_INTERVAL_SECONDS=1
+BEB_READY_CHECK_INTERVAL_SECONDS=30
 BEB_READY_CHECK_TIMEOUT_SECONDS=3
+BEB_READY_AUTH_REVALIDATE_SECONDS=300
 BEB_READY_DISCONNECT_DELAY_SECONDS=5
 BEB_READY_RECOVERY_DELAY_SECONDS=10
 BEB_READY_TOPIC=MQTT/ODOO_TO_PLC/topic
 ```
+
+Production default logging is `LOG_LEVEL=INFO`. Routine successful readiness checks, cached Odoo authentication messages, zero-row stale watchdog passes, and other repetitive internal polling diagnostics are DEBUG-only. Use `LOG_LEVEL=DEBUG` during BBA testing or troubleshooting when those details are needed. Production transaction traceability remains at INFO or above for MQTT receives, Odoo API commands, command publishes, queue processing, retries, completions, readiness transitions, and BR publication.
 
 The real `.env` file is ignored by Git. Do not print or log `ODOO_PASSWORD`.
 
@@ -381,8 +386,9 @@ BEB_API_IDEMPOTENCY_TTL_SECONDS=86400
 BEB_API_MAX_BODY_BYTES=16384
 BEB_API_LOG_REQUEST_BODY=true
 BEB_READY_ENABLED=true
-BEB_READY_CHECK_INTERVAL_SECONDS=1
+BEB_READY_CHECK_INTERVAL_SECONDS=30
 BEB_READY_CHECK_TIMEOUT_SECONDS=3
+BEB_READY_AUTH_REVALIDATE_SECONDS=300
 BEB_READY_DISCONNECT_DELAY_SECONDS=5
 BEB_READY_RECOVERY_DELAY_SECONDS=10
 BEB_READY_TOPIC=MQTT/ODOO_TO_PLC/topic
@@ -462,6 +468,15 @@ BBA or BBW Docker host
           persisted in Docker volume: beb-mosquitto-log
 ```
 
+The production Compose stack runs two containers:
+
+```text
+beb
+beb-mosquitto
+```
+
+`beb` serves the API on host `127.0.0.1:8000`, connects to Mosquitto as `mosquitto:1883` inside Docker, and stores SQLite at `/app/data/bridge.db` in the existing `beb-sqlite-data` volume. `beb-mosquitto` listens on LAN port `1883` and uses the existing Mosquitto data and log volumes. Both services use `restart: unless-stopped` and health checks.
+
 Docker installation on Ubuntu:
 
 ```bash
@@ -520,16 +535,43 @@ ODOO_PASSWORD='value-with-$-characters'
 BEB_API_PASSWORD='value-with-$-characters'
 ```
 
-By default the API and MQTT ports are bound to localhost on the Docker host:
+By default the API is bound to localhost on the Docker host and Mosquitto is exposed on port `1883` for PLC LAN access:
 
 ```env
 BEB_API_BIND=127.0.0.1
 BEB_API_HOST_PORT=8000
-MQTT_BIND=127.0.0.1
-MQTT_HOST_PORT=1883
 ```
 
-If a PLC or validation client must connect to Mosquitto from the LAN, set `MQTT_BIND` to the Docker host LAN IP and restrict access with host firewall rules. Do not expose MQTT port `1883` to the public internet.
+Restrict MQTT with host firewall rules and trusted LAN design. Do not expose MQTT port `1883` to the public internet.
+
+Operational commands:
+
+```bash
+# start or update
+docker compose up -d --build
+
+# stop without deleting volumes
+docker compose stop
+
+# status
+docker compose ps
+
+# health
+curl http://127.0.0.1:8000/health
+
+# live BEB logs
+docker compose logs -f beb
+
+# live Mosquitto logs
+docker compose logs -f mosquitto
+
+# read-only BBW live monitor
+./beb-monitor.sh
+```
+
+`beb-monitor.sh` is read-only. It does not restart containers, change `.env`, modify SQLite, run migrations, publish MQTT messages, or alter production behavior. It displays Docker status, `/health`, selected BEB application timestamps converted from UTC to `Asia/Kolkata`, container CPU/memory/network/block I/O, filtered Mosquitto client history for `BEB_BBW_TABLE1` and `FX5U_TEST`, SQLite integrity and status summaries, the latest `mqtt_messages`, and then live BEB logs.
+
+Docker log rotation is configured for both containers with the `json-file` driver, `max-size: 10m`, and `max-file: 5`. This bounds Docker-managed log growth; it does not change BEB transaction logging semantics.
 
 Updating from Git:
 
@@ -617,6 +659,14 @@ restart: unless-stopped
 ```
 
 Both BEB and Mosquitto use this policy, so containers automatically restart after an Ubuntu reboot unless they were manually stopped.
+
+Rollback and backup warnings:
+
+- Containers are disposable; the SQLite Docker volume is not.
+- Back up `beb-sqlite-data` before production updates, rollbacks, host migration, or volume maintenance.
+- Image versioning and Git rollback are separate from SQLite data backup.
+- Do not delete or recreate Docker volumes during rollback unless a verified backup has been restored intentionally.
+- BEB does not provide automatic rollback.
 
 Recommended production Docker architecture:
 

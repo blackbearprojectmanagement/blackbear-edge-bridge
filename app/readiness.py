@@ -184,7 +184,7 @@ class ReadinessMonitor:
         now = checked_at or datetime.now(timezone.utc)
         success, error = self._run_readiness_check()
         self._state.record_check(success=success, checked_at=now, error=error)
-        LOGGER.info(
+        LOGGER.debug(
             "Readiness raw check result=%s state=%s error=%s",
             success,
             self._state.state().value,
@@ -217,7 +217,7 @@ class ReadinessMonitor:
         current_state = self._state.state()
         if current_state is ReadinessState.READY:
             if self._state.disconnect_started_at() is not None:
-                LOGGER.info(
+                LOGGER.debug(
                     "Readiness disconnect debounce reset state=%s raw_check_result=True",
                     current_state.value,
                 )
@@ -226,7 +226,7 @@ class ReadinessMonitor:
             return
 
         if self._state.disconnect_started_at() is not None:
-            LOGGER.info(
+            LOGGER.debug(
                 "Readiness disconnect debounce reset state=%s raw_check_result=True",
                 current_state.value,
             )
@@ -235,7 +235,7 @@ class ReadinessMonitor:
         recovery_started_at = self._state.recovery_started_at()
         if recovery_started_at is None:
             self._state.set_recovery_started_at(now)
-            LOGGER.info(
+            LOGGER.debug(
                 "Readiness recovery debounce started state=%s raw_check_result=True",
                 current_state.value,
             )
@@ -248,7 +248,7 @@ class ReadinessMonitor:
     def _handle_failure(self, now: datetime, error: str | None) -> None:
         current_state = self._state.state()
         if self._state.recovery_started_at() is not None:
-            LOGGER.info(
+            LOGGER.debug(
                 "Readiness recovery debounce reset state=%s raw_check_result=False error=%s",
                 current_state.value,
                 error,
@@ -266,7 +266,7 @@ class ReadinessMonitor:
         disconnect_started_at = self._state.disconnect_started_at()
         if disconnect_started_at is None:
             self._state.set_disconnect_started_at(now)
-            LOGGER.info(
+            LOGGER.debug(
                 "Readiness disconnect debounce started state=%s raw_check_result=False error=%s",
                 current_state.value,
                 error,

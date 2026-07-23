@@ -42,8 +42,9 @@ class AppConfig:
     beb_api_max_body_bytes: int = 16384
     beb_api_log_request_body: bool = True
     beb_ready_enabled: bool = True
-    beb_ready_check_interval_seconds: int = 1
+    beb_ready_check_interval_seconds: int = 30
     beb_ready_check_timeout_seconds: int = 3
+    beb_ready_auth_revalidate_seconds: int = 300
     beb_ready_disconnect_delay_seconds: int = 5
     beb_ready_recovery_delay_seconds: int = 10
     beb_ready_topic: str = "MQTT/ODOO_TO_PLC/topic"
@@ -125,10 +126,13 @@ def load_config() -> AppConfig:
         beb_api_log_request_body=_get_bool("BEB_API_LOG_REQUEST_BODY", True),
         beb_ready_enabled=_get_bool("BEB_READY_ENABLED", True),
         beb_ready_check_interval_seconds=_get_int(
-            "BEB_READY_CHECK_INTERVAL_SECONDS", 1
+            "BEB_READY_CHECK_INTERVAL_SECONDS", 30
         ),
         beb_ready_check_timeout_seconds=_get_int(
             "BEB_READY_CHECK_TIMEOUT_SECONDS", 3
+        ),
+        beb_ready_auth_revalidate_seconds=_get_int(
+            "BEB_READY_AUTH_REVALIDATE_SECONDS", 300
         ),
         beb_ready_disconnect_delay_seconds=_get_int(
             "BEB_READY_DISCONNECT_DELAY_SECONDS", 5
